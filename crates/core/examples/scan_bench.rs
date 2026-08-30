@@ -59,95 +59,132 @@ fn generate_tree(root: &Path, target_files: usize) -> anyhow::Result<()> {
 
 const DB_INSERT_BATCH_SIZE: usize = 10_000;
 
-/// Mirrors apps/desktop/src-tauri/src/lib.rs's StreamingSink exactly:
-/// fold_into for aggregates (O(directories) memory), buffered batched DB
-/// insert, no FileEntry accumulation.
-struct ProductionSink<'a> {
-    db: &'a mut StorageDatabase,
-    root: PathBuf,
-    aggregates: HashMap<PathBuf, DirectoryAggregate>,
-    pending_for_db: Vec<FileEntry>,
-    sys: System,
-    pid: Pid,
-    peak_mb: f64,
-    first_batch_at: Option<Instant>,
-    start: Instant,
-}
+/// Mirrors apps/desktop/src-tauri/src/lib.rs's ChannelSink + run_writer
+/// pipeline exactly: scanner thread sends batches over a bounded channel,
+/// a dedicated writer thread folds aggregates and does buffered batched DB
+/// inserts. This replaces the earlier single-thread ProductionSink, which
+/// (correctly) measured that the old inline design serialized traversal
+/// behind DB writes -- this benchmark now measures the fixed pipeline.
+use std::sync::mpsc::sync_channel;
 
-impl<'a> ProductionSink<'a> {
-    fn flush(&mut self) {
-        if self.pending_for_db.is_empty() {
-            return;
-        }
-        let _ = self.db.insert_entries(&self.pending_for_db);
-        self.pending_for_db.clear();
-    }
+struct ChannelSink {
+    tx: std::sync::mpsc::SyncSender<Vec<FileEntry>>,
+    send_wait: std::time::Duration,
 }
-
-impl<'a> ScanProgressSink for ProductionSink<'a> {
+impl ScanProgressSink for ChannelSink {
     fn on_entries(&mut self, entries: Vec<FileEntry>) {
-        if self.first_batch_at.is_none() {
-            self.first_batch_at = Some(Instant::now());
-        }
-        fold_into(&mut self.aggregates, &self.root, &entries);
-        self.pending_for_db.extend(entries);
-        if self.pending_for_db.len() >= DB_INSERT_BATCH_SIZE {
-            self.flush();
-        }
-        let mb = current_memory_mb(&mut self.sys, self.pid);
-        if mb > self.peak_mb {
-            self.peak_mb = mb;
-        }
+        let t0 = Instant::now();
+        let _ = self.tx.send(entries);
+        self.send_wait += t0.elapsed();
     }
-    fn on_complete(&mut self, _stats: &ScanStats) {
-        self.flush();
-    }
+    fn on_complete(&mut self, _stats: &ScanStats) {}
 }
 
-fn run_production_mode(root: &Path) -> anyhow::Result<()> {
+fn run_production_mode(root: &Path, db_batch_size: usize, channel_capacity: usize) -> anyhow::Result<()> {
     let mut sys = System::new();
     let pid = Pid::from_u32(std::process::id());
     let start_mb = current_memory_mb(&mut sys, pid);
 
-    let db_path = std::env::temp_dir().join("spacewise-bench-production.db");
+    let db_path = std::env::temp_dir().join(format!("spacewise-bench-production-{db_batch_size}.db"));
     let _ = std::fs::remove_file(&db_path);
-    let mut db = StorageDatabase::open(&db_path)?;
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    let db = std::sync::Arc::new(std::sync::Mutex::new(StorageDatabase::open(&db_path)?));
 
+    let (tx, rx) = sync_channel::<Vec<FileEntry>>(channel_capacity);
     let overall_start = Instant::now();
-    let mut sink = ProductionSink {
-        db: &mut db,
-        root: root.to_path_buf(),
-        aggregates: HashMap::new(),
-        pending_for_db: Vec::with_capacity(DB_INSERT_BATCH_SIZE),
-        sys,
-        pid,
-        peak_mb: start_mb,
-        first_batch_at: None,
-        start: overall_start,
-    };
+
+    let writer_db = db.clone();
+    let writer_root = root.to_path_buf();
+    let writer_handle = std::thread::spawn(move || {
+        let mut aggregates: HashMap<PathBuf, DirectoryAggregate> = HashMap::new();
+        let mut pending: Vec<FileEntry> = Vec::with_capacity(db_batch_size);
+        let mut sys = System::new();
+        let pid = Pid::from_u32(std::process::id());
+        let mut peak_mb: f64 = 0.0;
+        let mut first_batch_at: Option<Instant> = None;
+        let mut insert_time = std::time::Duration::ZERO;
+        let mut fold_time = std::time::Duration::ZERO;
+
+        for batch in rx {
+            if first_batch_at.is_none() {
+                first_batch_at = Some(Instant::now());
+            }
+            let t0 = Instant::now();
+            fold_into(&mut aggregates, &writer_root, &batch);
+            fold_time += t0.elapsed();
+
+            pending.extend(batch);
+            if pending.len() >= db_batch_size {
+                let t1 = Instant::now();
+                if let Ok(mut db) = writer_db.lock() {
+                    let _ = db.insert_entries(&pending);
+                }
+                insert_time += t1.elapsed();
+                pending.clear();
+            }
+            let mb = current_memory_mb(&mut sys, pid);
+            if mb > peak_mb {
+                peak_mb = mb;
+            }
+        }
+        if !pending.is_empty() {
+            let t1 = Instant::now();
+            if let Ok(mut db) = writer_db.lock() {
+                let _ = db.insert_entries(&pending);
+            }
+            insert_time += t1.elapsed();
+        }
+        (aggregates, peak_mb, first_batch_at, insert_time, fold_time)
+    });
+
+    let mut sink = ChannelSink { tx, send_wait: std::time::Duration::ZERO };
     let stats = Scanner::new().scan(&ScanOptions::new(root), &mut sink)?;
-    let scan_plus_insert_duration = overall_start.elapsed();
-    let time_to_first_batch_ms = sink.first_batch_at.map(|t| t.duration_since(sink.start).as_millis());
-    let peak_mb = sink.peak_mb;
-    let unique_dirs = sink.aggregates.len();
+    let scanner_duration = overall_start.elapsed();
+    let send_wait = sink.send_wait;
+    drop(sink);
 
-    // Aggregates are already folded incrementally throughout the scan (that
-    // is the point being measured) -- no separate final-persist step is
-    // needed for this benchmark's purpose.
+    let (aggregates, peak_mb, first_batch_at, insert_time, fold_time) =
+        writer_handle.join().map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
+    let total_duration = overall_start.elapsed();
+    let time_to_first_batch_ms = first_batch_at.map(|t| t.duration_since(overall_start).as_millis());
+    let unique_dirs = aggregates.len();
+
     let end_mb = current_memory_mb(&mut System::new_all(), pid);
-    let db_size_mb = std::fs::metadata(&db_path).map(|m| m.len() as f64 / 1_000_000.0).unwrap_or(0.0);
+    let db_size_before_checkpoint_mb = std::fs::metadata(&db_path).map(|m| m.len() as f64 / 1_000_000.0).unwrap_or(0.0);
+    let wal_size_before_checkpoint_mb =
+        std::fs::metadata(db_path.with_extension("db-wal")).map(|m| m.len() as f64 / 1_000_000.0).unwrap_or(0.0);
 
-    println!("== Production-path mode (StreamingSink-equivalent) ==");
-    println!("  files_scanned:              {}", stats.files_scanned);
+    // Explicit checkpoint + report before/after, per the 870MB investigation:
+    // does the on-disk footprint reflect retained data, or un-checkpointed WAL?
+    {
+        let db = db.lock().unwrap();
+        db.checkpoint_wal().ok();
+    }
+    let db_size_after_checkpoint_mb = std::fs::metadata(&db_path).map(|m| m.len() as f64 / 1_000_000.0).unwrap_or(0.0);
+    let wal_size_after_checkpoint_mb =
+        std::fs::metadata(db_path.with_extension("db-wal")).map(|m| m.len() as f64 / 1_000_000.0).unwrap_or(0.0);
+
+    println!("== Production-path mode (real pipeline: scanner thread -> bounded channel -> writer thread) ==");
+    println!("  db_batch_size:               {db_batch_size}");
+    println!("  channel_capacity (batches):  {channel_capacity}");
+    println!("  files_scanned:               {}", stats.files_scanned);
     println!("  dirs_scanned:                {}", stats.dirs_scanned);
-    println!("  unique directories folded:   {}", unique_dirs);
-    println!("  scan + insert + fold duration: {:?}", scan_plus_insert_duration);
-    println!("  files/sec (combined):        {:.0}", stats.files_scanned as f64 / scan_plus_insert_duration.as_secs_f64().max(0.001));
+    println!("  unique directories folded:   {unique_dirs}");
+    println!("  scanner thread wall time:    {:?}", scanner_duration);
+    println!("  scanner time blocked on send (backpressure): {:?}", send_wait);
+    println!("  writer fold time:            {:?}", fold_time);
+    println!("  writer db insert time:       {:?}", insert_time);
+    println!("  total wall time (scan+write): {:?}", total_duration);
+    println!("  files/sec (combined):        {:.0}", stats.files_scanned as f64 / total_duration.as_secs_f64().max(0.001));
     println!("  time to first batch:         {:?} ms", time_to_first_batch_ms);
     println!("  RSS start:                   {:.1} MB", start_mb);
     println!("  RSS peak:                    {:.1} MB", peak_mb);
     println!("  RSS end (post-scan):         {:.1} MB", end_mb);
-    println!("  db file size:                {:.1} MB", db_size_mb);
+    println!("  db file size before checkpoint: {:.1} MB", db_size_before_checkpoint_mb);
+    println!("  wal file size before checkpoint: {:.1} MB", wal_size_before_checkpoint_mb);
+    println!("  db file size after checkpoint:  {:.1} MB", db_size_after_checkpoint_mb);
+    println!("  wal file size after checkpoint: {:.1} MB", wal_size_after_checkpoint_mb);
 
     drop(db);
     let _ = std::fs::remove_file(&db_path);
@@ -161,6 +198,9 @@ fn main() -> anyhow::Result<()> {
     let mut target_files: Option<usize> = None;
     let mut existing_dir: Option<PathBuf> = None;
     let mut production_mode = false;
+    let mut db_batch_size: usize = 10_000;
+    let mut channel_capacity: usize = 8;
+    let mut keep_tree = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -172,8 +212,20 @@ fn main() -> anyhow::Result<()> {
                 existing_dir = args.get(i + 1).map(PathBuf::from);
                 i += 2;
             }
+            "--db-batch" => {
+                db_batch_size = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(10_000);
+                i += 2;
+            }
+            "--channel-capacity" => {
+                channel_capacity = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(8);
+                i += 2;
+            }
             "--production" => {
                 production_mode = true;
+                i += 1;
+            }
+            "--keep-tree" => {
+                keep_tree = true;
                 i += 1;
             }
             _ => i += 1,
@@ -197,9 +249,13 @@ fn main() -> anyhow::Result<()> {
     };
 
     if production_mode {
-        run_production_mode(&root)?;
+        run_production_mode(&root, db_batch_size, channel_capacity)?;
         if let Some(dir) = _tempdir_guard {
-            let _ = std::fs::remove_dir_all(dir);
+            if !keep_tree {
+                let _ = std::fs::remove_dir_all(dir);
+            } else {
+                println!("(kept synthetic tree at {} -- pass --dir to reuse it, remove manually when done)", dir.display());
+            }
         }
         return Ok(());
     }

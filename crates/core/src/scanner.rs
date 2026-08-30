@@ -266,7 +266,7 @@ fn build_entry_checked(scan_id: Uuid) -> impl Fn(PathBuf) -> Result<FileEntry, (
             // Real system-file detection lives in the classification engine
             // (Phase 6), which knows platform-specific protected roots.
             is_system: false,
-            filesystem_id: same_file::Handle::from_path(&path).ok().map(|h| format!("{:?}", h)),
+            filesystem_id: compact_filesystem_id(&meta),
             logical_size: meta.len(),
             // Real allocated/on-disk size (accounting for sparse files, APFS
             // clones, NTFS compression) is enriched later via
@@ -283,6 +283,28 @@ fn build_entry_checked(scan_id: Uuid) -> impl Fn(PathBuf) -> Result<FileEntry, (
 
 fn to_datetime(t: SystemTime) -> DateTime<Utc> {
     DateTime::<Utc>::from(t)
+}
+
+/// Was previously `format!("{:?}", same_file::Handle)` -- measured at 194
+/// bytes/row and, worse, it embeds the full absolute path a *third* time
+/// (already stored in `path` and `parent`). No query anywhere reads this
+/// field today (grepped the whole workspace to confirm), so paying that
+/// cost on every one of a scan's millions of rows was pure waste. Unix gets
+/// a real, cheap, meaningful (dev, inode) identity; Windows leaves it unset
+/// for now rather than pay same_file's verbose Debug format -- a real
+/// compact volume+file-index needs the still-unstable std
+/// `windows_by_handle` feature (see the file_id note earlier in this file)
+/// or a small win32 FFI call, which is PlatformAdapter::enrich_metadata's
+/// job, not the platform-agnostic scanner's.
+#[cfg(unix)]
+fn compact_filesystem_id(meta: &std::fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    Some(format!("{}:{}", meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn compact_filesystem_id(_meta: &std::fs::Metadata) -> Option<String> {
+    None
 }
 
 #[cfg(unix)]

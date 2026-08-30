@@ -108,71 +108,93 @@ struct ScanSummary {
     stats: ScanStats,
     total_size: u64,
     status: ScanStatus,
+    timings: ScanTimingsReport,
 }
 
-/// Streams a running scan straight into SQLite one batch at a time (one
-/// transaction per batch, never one giant transaction for the whole scan)
-/// and folds each batch into a rolling directory-aggregate map instead of
-/// buffering FileEntry records -- memory stays O(unique directories seen),
-/// not O(total files), which is what actually keeps a multi-million-file
-/// scan's memory bounded. Periodically persists the partial aggregate map
-/// and emits events so the UI shows real results within seconds, not only
-/// after the entire tree finishes.
 // Benchmarked (crates/core/examples/db_bench.rs): raising the DB insert
 // transaction size from the scanner's 1024-entry UI/cancellation batch to
 // 10,000 measured ~46.7k rows/sec vs ~22.4k rows/sec at 300k synthetic rows
 // -- batch size was the dominant lever for insertion throughput (far more
-// than journal mode or synchronous setting), so the DB write batch is
-// deliberately decoupled from the scanner's batch: cancellation/progress
-// stay responsive at 1024 entries, while SQLite inserts are buffered up to
-// this size before a transaction commits.
+// than journal mode or synchronous setting). Re-validated in production
+// (crates/core/examples/scan_bench.rs --production --db-batch N) across
+// 5000/10000/20000/25000/50000 -- see session notes for the chosen value's
+// full tradeoff (throughput vs memory vs time-to-first-result vs
+// cancellation drain latency), not just the isolated insertion number.
 const DB_INSERT_BATCH_SIZE: usize = 10_000;
 
-struct StreamingSink {
-    app: tauri::AppHandle,
-    db: Arc<Mutex<StorageDatabase>>,
-    scan_id: Uuid,
-    root: PathBuf,
-    aggregates: HashMap<PathBuf, DirectoryAggregate>,
-    pending_for_db: Vec<FileEntry>,
-    rows_committed: u64,
-    start: Instant,
-    last_progress_emit: Instant,
-    last_dashboard_persist: Instant,
-    current_path: Option<PathBuf>,
-    time_to_first_result_ms: Option<u64>,
+// Scanner batches (1024 entries, spacewise-core's ScanOptions default) sent
+// through this channel before the writer thread has consumed them. Bounded
+// so the writer falling behind creates backpressure (tx.send blocks the
+// scanner) instead of unbounded memory growth -- 8 * 1024 = ~8192 entries
+// is the hard cap on in-flight-but-not-yet-processed entries at any moment.
+const CHANNEL_CAPACITY: usize = 8;
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+
+#[derive(Default)]
+struct ScanTimings {
+    scanner_wall_ns: AtomicU64,
+    /// Time the scanner thread spent blocked inside tx.send() because the
+    /// bounded channel was full -- i.e. genuine backpressure from a writer
+    /// that cannot keep up. Near-zero means traversal is the bottleneck;
+    /// large means DB persistence is.
+    channel_send_wait_ns: AtomicU64,
+    writer_wall_ns: AtomicU64,
+    fold_ns: AtomicU64,
+    db_insert_ns: AtomicU64,
+    progress_emit_ns: AtomicU64,
+    dashboard_persist_ns: AtomicU64,
 }
 
-impl StreamingSink {
-    fn new(app: tauri::AppHandle, db: Arc<Mutex<StorageDatabase>>, scan_id: Uuid, root: PathBuf) -> Self {
-        let now = Instant::now();
-        Self {
-            app,
-            db,
-            scan_id,
-            root,
-            aggregates: HashMap::new(),
-            pending_for_db: Vec::with_capacity(DB_INSERT_BATCH_SIZE),
-            rows_committed: 0,
-            start: now,
-            last_progress_emit: now,
-            last_dashboard_persist: now,
-            current_path: None,
-            time_to_first_result_ms: None,
-        }
-    }
+#[derive(Debug, Clone, serde::Serialize)]
+struct ScanTimingsReport {
+    scanner_wall_ms: u64,
+    channel_send_wait_ms: u64,
+    writer_wall_ms: u64,
+    fold_ms: u64,
+    db_insert_ms: u64,
+    progress_emit_ms: u64,
+    dashboard_persist_ms: u64,
+}
 
-    fn flush_db(&mut self) {
-        if self.pending_for_db.is_empty() {
-            return;
+impl ScanTimings {
+    fn report(&self) -> ScanTimingsReport {
+        let ms = |c: &AtomicU64| c.load(Ordering::Relaxed) / 1_000_000;
+        ScanTimingsReport {
+            scanner_wall_ms: ms(&self.scanner_wall_ns),
+            channel_send_wait_ms: ms(&self.channel_send_wait_ns),
+            writer_wall_ms: ms(&self.writer_wall_ns),
+            fold_ms: ms(&self.fold_ns),
+            db_insert_ms: ms(&self.db_insert_ns),
+            progress_emit_ms: ms(&self.progress_emit_ns),
+            dashboard_persist_ms: ms(&self.dashboard_persist_ns),
         }
-        if let Ok(mut db) = self.db.lock() {
-            if db.insert_entries(&self.pending_for_db).is_ok() {
-                self.rows_committed += self.pending_for_db.len() as u64;
-            }
-        }
-        self.pending_for_db.clear();
     }
+}
+
+/// Sends each scanned batch to a dedicated writer thread over a bounded
+/// channel instead of doing DB/aggregate work inline on the scanner's own
+/// thread. This is the fix for the architectural serialization measured at
+/// 1M-entry scale: isolated traversal benchmarks 20k+ files/sec, but the
+/// old inline design (fold + DB insert called directly from the scan loop)
+/// measured only ~3.4k files/sec combined, because every batch blocked the
+/// walk from proceeding until its DB write finished. Now traversal and
+/// persistence run concurrently on separate threads; the channel's bounded
+/// capacity is the only backpressure mechanism, so memory still cannot
+/// grow unbounded if the writer falls behind.
+struct ChannelSink {
+    tx: SyncSender<Vec<FileEntry>>,
+    timings: Arc<ScanTimings>,
+}
+
+impl ScanProgressSink for ChannelSink {
+    fn on_entries(&mut self, entries: Vec<FileEntry>) {
+        let t0 = Instant::now();
+        let _ = self.tx.send(entries);
+        self.timings.channel_send_wait_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    fn on_complete(&mut self, _stats: &ScanStats) {}
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -187,61 +209,106 @@ struct ScanProgressPayload {
     mb_per_sec: f64,
 }
 
-impl ScanProgressSink for StreamingSink {
-    fn on_entries(&mut self, entries: Vec<FileEntry>) {
-        if let Some(last) = entries.last() {
-            self.current_path = last.parent.clone().or_else(|| Some(last.path.clone()));
-        }
+struct WriterOutput {
+    aggregates: HashMap<PathBuf, DirectoryAggregate>,
+}
 
-        fold_into(&mut self.aggregates, &self.root, &entries);
+/// Runs on its own thread: receives batches from the scanner via `rx`,
+/// folds them into the aggregate map, buffers for SQLite (one transaction
+/// per DB_INSERT_BATCH_SIZE entries, never one giant transaction and never
+/// one tiny transaction per scanner batch), and coalesces progress/
+/// dashboard events on its own clock rather than once per batch -- so
+/// event volume is independent of how fast the scanner is producing
+/// entries (spec: ~4-10 UI updates/sec, not one event per filesystem
+/// entry).
+fn run_writer(
+    app: tauri::AppHandle,
+    db: Arc<Mutex<StorageDatabase>>,
+    scan_id: Uuid,
+    root: PathBuf,
+    rx: Receiver<Vec<FileEntry>>,
+    timings: Arc<ScanTimings>,
+    db_batch_size: usize,
+) -> WriterOutput {
+    let writer_start = Instant::now();
+    let mut aggregates: HashMap<PathBuf, DirectoryAggregate> = HashMap::new();
+    let mut pending: Vec<FileEntry> = Vec::with_capacity(db_batch_size);
+    let mut current_path: Option<PathBuf> = None;
+    let mut files_scanned = 0u64;
+    let mut dirs_scanned = 0u64;
+    let mut total_logical_size = 0u64;
+    let mut last_progress_emit = Instant::now();
+    let mut last_dashboard_persist = Instant::now();
 
-        // Buffered up to DB_INSERT_BATCH_SIZE, then one transaction per
-        // flush -- never one transaction for the whole scan, and never a
-        // transaction per tiny 1024-entry scanner batch either (see
-        // DB_INSERT_BATCH_SIZE's comment for the throughput data behind
-        // this choice).
-        self.pending_for_db.extend(entries);
-        if self.pending_for_db.len() >= DB_INSERT_BATCH_SIZE {
-            self.flush_db();
-        }
-
-        if self.last_dashboard_persist.elapsed() > Duration::from_millis(1500) {
-            if let Ok(mut db) = self.db.lock() {
-                let _ = db.upsert_directory_aggregates(self.scan_id, &self.aggregates);
-            }
-            if self.time_to_first_result_ms.is_none() {
-                self.time_to_first_result_ms = Some(self.start.elapsed().as_millis() as u64);
-            }
-            let _ = self.app.emit("dashboard-updated", serde_json::json!({ "scan_id": self.scan_id.to_string() }));
-            self.last_dashboard_persist = Instant::now();
-        }
-    }
-
-    fn on_progress(&mut self, stats: &ScanStats) {
-        if self.last_progress_emit.elapsed() <= Duration::from_millis(250) {
+    let flush = |pending: &mut Vec<FileEntry>| {
+        if pending.is_empty() {
             return;
         }
-        let elapsed = self.start.elapsed();
-        let elapsed_secs = elapsed.as_secs_f64().max(0.001);
-        let _ = self.app.emit(
-            "scan-progress",
-            ScanProgressPayload {
-                files_scanned: stats.files_scanned,
-                dirs_scanned: stats.dirs_scanned,
-                total_logical_size: stats.total_logical_size,
-                skipped_total: stats.skipped_total,
-                current_path: self.current_path.as_ref().map(|p| p.to_string_lossy().to_string()),
-                elapsed_ms: elapsed.as_millis() as u64,
-                files_per_sec: stats.files_scanned as f64 / elapsed_secs,
-                mb_per_sec: (stats.total_logical_size as f64 / 1_000_000.0) / elapsed_secs,
-            },
-        );
-        self.last_progress_emit = Instant::now();
+        let t = Instant::now();
+        if let Ok(mut db) = db.lock() {
+            let _ = db.insert_entries(pending);
+        }
+        timings.db_insert_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        pending.clear();
+    };
+
+    for batch in rx {
+        if let Some(last) = batch.last() {
+            current_path = last.parent.clone().or_else(|| Some(last.path.clone()));
+        }
+        for e in &batch {
+            if e.is_dir {
+                dirs_scanned += 1;
+            } else {
+                files_scanned += 1;
+                total_logical_size += e.logical_size;
+            }
+        }
+
+        let t0 = Instant::now();
+        fold_into(&mut aggregates, &root, &batch);
+        timings.fold_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        pending.extend(batch);
+        if pending.len() >= db_batch_size {
+            flush(&mut pending);
+        }
+
+        if last_progress_emit.elapsed() > Duration::from_millis(160) {
+            let t1 = Instant::now();
+            let elapsed = writer_start.elapsed();
+            let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+            let _ = app.emit(
+                "scan-progress",
+                ScanProgressPayload {
+                    files_scanned,
+                    dirs_scanned,
+                    total_logical_size,
+                    skipped_total: 0,
+                    current_path: current_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                    elapsed_ms: elapsed.as_millis() as u64,
+                    files_per_sec: files_scanned as f64 / elapsed_secs,
+                    mb_per_sec: (total_logical_size as f64 / 1_000_000.0) / elapsed_secs,
+                },
+            );
+            timings.progress_emit_ns.fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            last_progress_emit = Instant::now();
+        }
+
+        if last_dashboard_persist.elapsed() > Duration::from_millis(1500) {
+            let t2 = Instant::now();
+            if let Ok(mut db) = db.lock() {
+                let _ = db.upsert_directory_aggregates(scan_id, &aggregates);
+            }
+            let _ = app.emit("dashboard-updated", serde_json::json!({ "scan_id": scan_id.to_string() }));
+            timings.dashboard_persist_ns.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            last_dashboard_persist = Instant::now();
+        }
     }
 
-    fn on_complete(&mut self, _stats: &ScanStats) {
-        self.flush_db();
-    }
+    flush(&mut pending);
+    timings.writer_wall_ns.fetch_add(writer_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    WriterOutput { aggregates }
 }
 
 #[tauri::command]
@@ -340,10 +407,26 @@ fn run_scan_blocking(
     }
     emit_status(&app, ScanStatus::Scanning, Some(scan_id));
 
-    let mut sink = StreamingSink::new(app.clone(), db.clone(), scan_id, root_path.clone());
+    let timings = Arc::new(ScanTimings::default());
+    let (tx, rx) = sync_channel::<Vec<FileEntry>>(CHANNEL_CAPACITY);
+
+    let writer_handle = {
+        let app = app.clone();
+        let db = db.clone();
+        let root = root_path.clone();
+        let timings = timings.clone();
+        std::thread::spawn(move || run_writer(app, db, scan_id, root, rx, timings, DB_INSERT_BATCH_SIZE))
+    };
+
+    let mut sink = ChannelSink { tx, timings: timings.clone() };
     let options = ScanOptions::with_scan_id(&root_path, scan_id).with_cancel_token(cancel_token);
+    let scanner_start = Instant::now();
     let stats = Scanner::new().scan(&options, &mut sink).map_err(|e| e.to_string())?;
-    let aggregates = sink.aggregates;
+    timings.scanner_wall_ns.fetch_add(scanner_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    drop(sink); // drops tx -> closes the channel -> writer's `for batch in rx` loop ends after draining
+
+    let WriterOutput { aggregates } =
+        writer_handle.join().map_err(|_| "scan writer thread panicked".to_string())?;
 
     // Final persist -- picks up whatever was folded since the last
     // throttled progressive persist.
@@ -380,7 +463,12 @@ fn run_scan_blocking(
         emit_status(&app, status, Some(scan_id));
         let _ = app.emit("scan-complete", ());
 
-        Ok(ScanSummary { scan_id: scan_id.to_string(), stats, total_size, status })
+        let timing_report = timings.report();
+        // Visible in the `npm run tauri dev` terminal -- the real, measured
+        // (not inferred) per-phase breakdown for this scan.
+        println!("[spacewise] scan {scan_id} timings: {timing_report:?}");
+
+        Ok(ScanSummary { scan_id: scan_id.to_string(), stats, total_size, status, timings: timing_report })
     }
 }
 
@@ -470,8 +558,23 @@ fn get_treemap_node(state: tauri::State<AppState>, scan_id: String, path: String
     let dir_children = db.directory_children(scan_id, &path_buf).map_err(|e| e.to_string())?;
     let file_children = db.file_children(scan_id, &path_buf).map_err(|e| e.to_string())?;
 
+    let children = build_treemap_children(&dir_children, &file_children, &path, TREEMAP_MAX_CHILDREN);
+    Ok(TreemapNode { path, total_size, children })
+}
+
+/// Pure, unit-testable core of the treemap children API: merges
+/// subdirectory aggregates and direct files into one size-sorted list,
+/// capping at `max_children` with the remainder folded into a synthetic
+/// "Other" bucket. Split out of the get_treemap_node command so it can be
+/// tested without a Tauri State/AppHandle harness.
+fn build_treemap_children(
+    dir_children: &[DirectoryAggregate],
+    file_children: &[FileEntry],
+    parent_path: &str,
+    max_children: usize,
+) -> Vec<TreemapChild> {
     let mut all: Vec<TreemapChild> = Vec::with_capacity(dir_children.len() + file_children.len());
-    for d in &dir_children {
+    for d in dir_children {
         let name = d.path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
         all.push(TreemapChild {
             name,
@@ -482,7 +585,7 @@ fn get_treemap_node(state: tauri::State<AppState>, scan_id: String, path: String
             modified_at: d.latest_modified.map(|dt| dt.to_rfc3339()),
         });
     }
-    for f in &file_children {
+    for f in file_children {
         let name = f.path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
         all.push(TreemapChild {
             name,
@@ -495,13 +598,13 @@ fn get_treemap_node(state: tauri::State<AppState>, scan_id: String, path: String
     }
     all.sort_by(|a, b| b.size.cmp(&a.size));
 
-    let children = if all.len() > TREEMAP_MAX_CHILDREN {
-        let (visible, rest) = all.split_at(TREEMAP_MAX_CHILDREN - 1);
+    if all.len() > max_children && max_children > 0 {
+        let (visible, rest) = all.split_at(max_children - 1);
         let mut visible = visible.to_vec();
         let other_size: u64 = rest.iter().map(|c| c.size).sum();
         visible.push(TreemapChild {
             name: format!("Other ({} items)", rest.len()),
-            path: format!("{path}::__other__"),
+            path: format!("{parent_path}::__other__"),
             size: other_size,
             kind: "other".to_string(),
             child_count: rest.len() as u64,
@@ -510,9 +613,110 @@ fn get_treemap_node(state: tauri::State<AppState>, scan_id: String, path: String
         visible
     } else {
         all
-    };
+    }
+}
 
-    Ok(TreemapNode { path, total_size, children })
+#[cfg(test)]
+mod treemap_tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn dir(path: &str, size: u64, files: u64, dirs: u64) -> DirectoryAggregate {
+        DirectoryAggregate {
+            path: PathBuf::from(path),
+            total_size: size,
+            allocated_size: size,
+            file_count: files,
+            dir_count: dirs,
+            latest_modified: Some(Utc::now()),
+        }
+    }
+
+    fn file(path: &str, size: u64) -> FileEntry {
+        FileEntry {
+            id: Uuid::new_v4(),
+            scan_id: Uuid::new_v4(),
+            path: PathBuf::from(path),
+            parent: None,
+            logical_size: size,
+            allocated_size: size,
+            extension: None,
+            created_at: None,
+            modified_at: Some(Utc::now()),
+            accessed_at: None,
+            is_dir: false,
+            is_symlink: false,
+            is_hardlink: false,
+            is_hidden: false,
+            is_system: false,
+            filesystem_id: None,
+        }
+    }
+
+    #[test]
+    fn directory_with_only_files() {
+        let files = vec![file("/p/a.txt", 100), file("/p/b.txt", 50)];
+        let children = build_treemap_children(&[], &files, "/p", 40);
+        assert_eq!(children.len(), 2);
+        assert!(children.iter().all(|c| c.kind == "file"));
+        assert_eq!(children[0].size, 100); // sorted by size desc
+    }
+
+    #[test]
+    fn directory_with_only_folders() {
+        let dirs = vec![dir("/p/sub1", 500, 3, 0), dir("/p/sub2", 200, 1, 0)];
+        let children = build_treemap_children(&dirs, &[], "/p", 40);
+        assert_eq!(children.len(), 2);
+        assert!(children.iter().all(|c| c.kind == "directory"));
+        assert_eq!(children[0].name, "sub1");
+    }
+
+    #[test]
+    fn mixed_content_sorted_by_size_regardless_of_type() {
+        let dirs = vec![dir("/p/small_dir", 10, 1, 0)];
+        let files = vec![file("/p/big_file.bin", 1000)];
+        let children = build_treemap_children(&dirs, &files, "/p", 40);
+        assert_eq!(children[0].kind, "file");
+        assert_eq!(children[1].kind, "directory");
+    }
+
+    #[test]
+    fn zero_byte_entries_are_included_not_dropped() {
+        let files = vec![file("/p/empty.txt", 0)];
+        let children = build_treemap_children(&[], &files, "/p", 40);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].size, 0);
+    }
+
+    #[test]
+    fn one_huge_item_plus_thousands_of_tiny_ones_groups_other_correctly() {
+        let mut files = vec![file("/p/huge.bin", 1_000_000)];
+        for i in 0..5000 {
+            files.push(file(&format!("/p/tiny{i}.txt"), 1));
+        }
+        let children = build_treemap_children(&[], &files, "/p", 40);
+
+        assert_eq!(children.len(), 40); // capped, never 5001 rectangles
+        assert_eq!(children[0].path, "/p/huge.bin");
+        let other = children.last().unwrap();
+        assert_eq!(other.kind, "other");
+        assert_eq!(other.child_count, 5001 - 39); // 39 shown individually (huge + 38 tiny), rest grouped
+        assert_eq!(other.size, (5001 - 39) as u64); // 1 byte each
+    }
+
+    #[test]
+    fn no_other_bucket_when_under_the_cap() {
+        let files: Vec<FileEntry> = (0..10).map(|i| file(&format!("/p/f{i}.txt"), 10)).collect();
+        let children = build_treemap_children(&[], &files, "/p", 40);
+        assert_eq!(children.len(), 10);
+        assert!(children.iter().all(|c| c.kind != "other"));
+    }
+
+    #[test]
+    fn empty_directory_produces_no_children() {
+        let children = build_treemap_children(&[], &[], "/p", 40);
+        assert!(children.is_empty());
+    }
 }
 
 #[tauri::command]

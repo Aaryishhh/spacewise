@@ -46,9 +46,35 @@ CREATE TABLE IF NOT EXISTS file_entries (
     is_system INTEGER NOT NULL,
     filesystem_id TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_file_entries_scan ON file_entries(scan_id);
+-- Index audit (which feature uses each index, is it needed, could a
+-- smaller composite replace it -- see db.rs comments above SCHEMA for the
+-- full writeup; kept short here since this is inside a Rust string literal
+-- and double quotes are not safe to use in this comment block):
+--   idx_file_entries_size:   large_files() and all_file_entries() both
+--                            filter (scan_id, is_dir) then either sort or
+--                            further filter by logical_size -- this index
+--                            serves both, including large_files ORDER BY
+--                            logical_size DESC directly from the index.
+--   idx_file_entries_parent: file_children(), the treemap's hot interactive
+--                            path (every drill-down click) -- WAS MISSING
+--                            entirely before this audit, meaning every
+--                            treemap click on a large scan did a full
+--                            scan_id-filtered table scan. Added here.
+-- Removed vs. the original three-index schema:
+--   idx_file_entries_scan (scan_id) alone -- redundant: any query that
+--     only filters by scan_id can already use the leftmost prefix of
+--     either composite index below, so this bought nothing and cost a
+--     full extra index over every row.
+--   idx_file_entries_modified (scan_id, is_dir, modified_at) -- built for
+--     large_files()'s modified_at <= ? OR-with-IS-NULL clause, but that
+--     shape is not something SQLite's planner can use as a primary access
+--     path, so it was never actually serving that query; no other query
+--     filters or sorts by modified_at.
+-- Net effect: still two indexes (so total bytes/row on file_entries is
+-- similar), but they are now the two the app's real query shapes need,
+-- including a genuine correctness/performance gap the audit found.
 CREATE INDEX IF NOT EXISTS idx_file_entries_size ON file_entries(scan_id, is_dir, logical_size);
-CREATE INDEX IF NOT EXISTS idx_file_entries_modified ON file_entries(scan_id, is_dir, modified_at);
+CREATE INDEX IF NOT EXISTS idx_file_entries_parent ON file_entries(scan_id, parent, is_dir);
 
 CREATE TABLE IF NOT EXISTS directory_aggregates (
     scan_id TEXT NOT NULL,
@@ -146,6 +172,20 @@ impl StorageDatabase {
              PRAGMA temp_store = MEMORY;
              PRAGMA cache_size = -32000;",
         )?;
+        Ok(())
+    }
+
+    /// Deliberately checkpoints the WAL back into the main DB file (spec
+    /// section 5: "implement sensible checkpoint behaviour, do not
+    /// checkpoint so aggressively that it destroys write throughput").
+    /// TRUNCATE mode both checkpoints and shrinks the WAL file back down,
+    /// which is what makes the on-disk footprint reflect retained data
+    /// rather than un-checkpointed WAL growth. Called periodically by the
+    /// scan writer (not after every batch -- that would serialize writes
+    /// again, the exact bug this pipeline was built to fix), and once at
+    /// the end of every scan.
+    pub fn checkpoint_wal(&self) -> anyhow::Result<()> {
+        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
     }
 
