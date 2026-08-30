@@ -401,6 +401,92 @@ mod tests {
         assert_eq!(stats.skipped_sample[0].path.as_deref(), Some(ghost.as_path()));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn does_not_follow_ntfs_junction_loop() {
+        // Junctions are a distinct NTFS reparse-point type from symlinks and
+        // are not created via std::os::windows::fs::symlink_dir -- shell out
+        // to mklink /J, which needs no elevated privilege.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let junction = real.join("loop_back");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J", junction.to_str().unwrap(), dir.path().to_str().unwrap()])
+            .status();
+        if status.map(|s| !s.success()).unwrap_or(true) {
+            return; // mklink unavailable in this environment -- not a scanner bug
+        }
+
+        let mut sink = CollectingSink::default();
+        let result = Scanner::new().scan(&ScanOptions::new(dir.path()), &mut sink);
+        assert!(result.is_ok(), "junction loop must not hang or error out the whole scan");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn does_not_follow_windows_symlink_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = real.join("loop_back");
+        // Creating a directory symlink on Windows needs either Developer
+        // Mode or an elevated process -- skip gracefully if unavailable
+        // rather than failing CI on machines without either.
+        if std::os::windows::fs::symlink_dir(dir.path(), &link).is_err() {
+            return;
+        }
+
+        let mut sink = CollectingSink::default();
+        let result = Scanner::new().scan(&ScanOptions::new(dir.path()), &mut sink);
+        assert!(result.is_ok(), "symlink loop must not hang or error out the whole scan");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_file_is_skipped_not_fatal() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked.bin");
+        fs::write(&locked, b"locked contents").unwrap();
+
+        // Open with zero share flags: no other handle (including this scan)
+        // can even read the file while this handle is held.
+        let _handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&locked)
+            .expect("should be able to open exclusively for this test");
+
+        let mut sink = CollectingSink::default();
+        let result = Scanner::new().scan(&ScanOptions::new(dir.path()), &mut sink);
+        assert!(result.is_ok(), "a locked file must not hang or abort the scan");
+        // symlink_metadata (stat) typically still succeeds on a locked file
+        // even when open-for-read would fail, so this mostly guards against
+        // a hang/panic regression rather than asserting a specific skip.
+    }
+
+    #[test]
+    fn files_disappearing_mid_scan_do_not_crash_it() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..300 {
+            fs::write(dir.path().join(format!("f{i}.bin")), vec![0u8; 16]).unwrap();
+        }
+
+        let dir_path = dir.path().to_path_buf();
+        let deleter = std::thread::spawn(move || {
+            for i in 0..300 {
+                let _ = fs::remove_file(dir_path.join(format!("f{i}.bin")));
+            }
+        });
+
+        let mut sink = CollectingSink::default();
+        let result = Scanner::new().scan(&ScanOptions::new(dir.path()), &mut sink);
+        deleter.join().unwrap();
+
+        assert!(result.is_ok(), "files vanishing during a scan must not crash it");
+    }
+
     #[test]
     fn very_deep_directory_tree_does_not_overflow_or_hang() {
         let dir = tempfile::tempdir().unwrap();

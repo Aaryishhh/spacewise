@@ -91,6 +91,13 @@ CREATE TABLE IF NOT EXISTS duplicate_groups (
     paths TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_duplicate_groups_scan ON duplicate_groups(scan_id);
+
+CREATE TABLE IF NOT EXISTS file_hash_cache (
+    path TEXT PRIMARY KEY,
+    size INTEGER NOT NULL,
+    modified_at TEXT,
+    content_hash TEXT NOT NULL
+);
 ";
 
 pub struct StorageDatabase {
@@ -463,6 +470,48 @@ impl StorageDatabase {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    // -- duplicate hash cache ---------------------------------------------
+
+    /// A file whose (size, modified_at) still matches its cached row is a
+    /// full-file-hash we can skip recomputing (crates/core/src/duplicates.rs
+    /// invalidates on any mismatch itself); this just loads what is known.
+    pub fn load_hash_cache(&self) -> anyhow::Result<HashMap<PathBuf, crate::duplicates::CachedHash>> {
+        let mut stmt = self.conn.prepare("SELECT path, size, modified_at, content_hash FROM file_hash_cache")?;
+        let rows = stmt.query_map([], |row| {
+            let path: String = row.get(0)?;
+            let modified_at: Option<String> = row.get(2)?;
+            Ok((
+                PathBuf::from(path),
+                crate::duplicates::CachedHash {
+                    size: row.get(1)?,
+                    modified_at: modified_at.and_then(|s| DateTime::parse_from_rfc3339(&s).ok()).map(|d| d.with_timezone(&Utc)),
+                    hash: row.get(3)?,
+                },
+            ))
+        })?;
+        rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
+    }
+
+    pub fn save_hash_cache(&mut self, cache: &HashMap<PathBuf, crate::duplicates::CachedHash>) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO file_hash_cache (path, size, modified_at, content_hash) VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(path) DO UPDATE SET size=excluded.size, modified_at=excluded.modified_at, content_hash=excluded.content_hash",
+            )?;
+            for (path, cached) in cache {
+                stmt.execute(params![
+                    path_str(path),
+                    cached.size,
+                    cached.modified_at.map(|d| d.to_rfc3339()),
+                    cached.hash,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     // -- history --------------------------------------------------------

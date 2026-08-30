@@ -66,6 +66,7 @@ struct AppState {
     // made the whole window "Not Responding" during a large scan.
     db: Arc<Mutex<StorageDatabase>>,
     scan_session: Arc<Mutex<ScanSession>>,
+    duplicate_cancel: Arc<Mutex<Option<CancellationToken>>>,
 }
 
 #[cfg(target_os = "windows")]
@@ -415,28 +416,72 @@ fn get_recommendations(state: tauri::State<AppState>, scan_id: String) -> Result
     Ok(RecommendationEngine::new().recommend(&classified, &classifier))
 }
 
+#[derive(Clone, serde::Serialize)]
+struct DuplicateProgressPayload {
+    hashed: usize,
+    total: usize,
+}
+
+struct EmittingDuplicateProgress {
+    app: tauri::AppHandle,
+    last_emit: Instant,
+}
+impl spacewise_core::duplicates::DuplicateProgressSink for EmittingDuplicateProgress {
+    fn on_progress(&mut self, hashed: usize, total: usize) {
+        if self.last_emit.elapsed() > Duration::from_millis(200) {
+            let _ = self.app.emit("duplicate-progress", DuplicateProgressPayload { hashed, total });
+            self.last_emit = Instant::now();
+        }
+    }
+}
+
 #[tauri::command]
-async fn get_duplicates(state: tauri::State<'_, AppState>, scan_id: String) -> Result<Vec<DuplicateGroup>, String> {
+async fn get_duplicates(app: tauri::AppHandle, state: tauri::State<'_, AppState>, scan_id: String) -> Result<Vec<DuplicateGroup>, String> {
     let scan_id = parse_scan_id(&scan_id)?;
     let db = state.db.clone();
+    let dup_cancel_slot = state.duplicate_cancel.clone();
+
+    let token = CancellationToken::new();
+    *dup_cancel_slot.lock().map_err(|e| e.to_string())? = Some(token.clone());
+
     // Full-file-content hashing is expensive on a large scan -- computed
     // lazily here (once; persisted after) rather than eagerly in run_scan,
     // and still kept off the window/event-loop thread via spawn_blocking.
-    tauri::async_runtime::spawn_blocking(move || {
+    // Opening the Duplicates page must never freeze the interface.
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let mut db = db.lock().map_err(|e| e.to_string())?;
         let existing = db.duplicate_groups(scan_id).map_err(|e| e.to_string())?;
         if !existing.is_empty() {
             return Ok(existing);
         }
         let files = db.all_file_entries(scan_id).map_err(|e| e.to_string())?;
-        let groups = DuplicateEngine::new().find_duplicates(&files);
+        let cache = db.load_hash_cache().unwrap_or_default();
+        let mut progress_sink = EmittingDuplicateProgress { app: app.clone(), last_emit: Instant::now() };
+        let (groups, updated_cache) = DuplicateEngine::new().find_duplicates_with(&files, &cache, &token, &mut progress_sink);
+        let _ = db.save_hash_cache(&updated_cache);
         if !groups.is_empty() {
             db.insert_duplicate_groups(scan_id, &groups).map_err(|e| e.to_string())?;
         }
+        let _ = app.emit("duplicate-complete", ());
         Ok(groups)
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    *dup_cancel_slot.lock().map_err(|e| e.to_string())? = None;
+    result
+}
+
+#[tauri::command]
+fn cancel_duplicate_scan(state: tauri::State<AppState>) -> Result<(), String> {
+    let slot = state.duplicate_cancel.lock().map_err(|e| e.to_string())?;
+    match slot.as_ref() {
+        Some(token) => {
+            token.cancel();
+            Ok(())
+        }
+        None => Err("no duplicate scan is currently running".to_string()),
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -542,6 +587,7 @@ pub fn run() {
             app.manage(AppState {
                 db: Arc::new(Mutex::new(db)),
                 scan_session: Arc::new(Mutex::new(ScanSession::default())),
+                duplicate_cancel: Arc::new(Mutex::new(None)),
             });
             Ok(())
         })
@@ -554,6 +600,7 @@ pub fn run() {
             get_large_files,
             get_recommendations,
             get_duplicates,
+            cancel_duplicate_scan,
             execute_cleanup,
             get_cleanup_history,
             get_growth_summary,

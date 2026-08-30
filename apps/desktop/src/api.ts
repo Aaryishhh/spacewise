@@ -1,17 +1,45 @@
 import { invoke } from "@tauri-apps/api/core";
 
+export type ScanStatus = "idle" | "starting" | "scanning" | "cancelling" | "completed" | "failed" | "cancelled";
+
+export interface SkippedItem {
+  path: string | null;
+  reason: string;
+}
+
 export interface ScanStats {
   files_scanned: number;
   dirs_scanned: number;
   total_logical_size: number;
   errors: number;
+  skipped_total: number;
+  skipped_sample: SkippedItem[];
   duration_ms: number;
+  cancelled: boolean;
 }
 
 export interface ScanSummary {
   scan_id: string;
   stats: ScanStats;
   total_size: number;
+  status: ScanStatus;
+}
+
+export interface ScanStatusPayload {
+  status: ScanStatus;
+  scan_id: string | null;
+  root: string | null;
+}
+
+export interface ScanProgressPayload {
+  files_scanned: number;
+  dirs_scanned: number;
+  total_logical_size: number;
+  skipped_total: number;
+  current_path: string | null;
+  elapsed_ms: number;
+  files_per_sec: number;
+  mb_per_sec: number;
 }
 
 export interface CategoryTotal {
@@ -122,6 +150,8 @@ export interface AppAssociation {
 
 export const api = {
   runScan: (root: string) => invoke<ScanSummary>("run_scan", { root }),
+  cancelScan: () => invoke<void>("cancel_scan"),
+  getScanStatus: () => invoke<ScanStatusPayload>("get_scan_status"),
   getDashboard: () => invoke<DashboardData | null>("get_dashboard"),
   getDirectoryChildren: (scanId: string, path: string) =>
     invoke<DirectoryAggregate[]>("get_directory_children", { scanId, path }),
