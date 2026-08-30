@@ -49,7 +49,7 @@ export default function Duplicates() {
             {g.paths.map((p) => (
               <div key={p} style={{ display: "flex", justifyContent: "space-between", fontSize: 13, padding: "4px 0", color: "var(--text-secondary)" }}>
                 <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p}</span>
-                <button onClick={() => api.revealPath(p)}>Reveal</button>
+                <button onClick={() => api.revealInFileManager(p)}>Reveal</button>
               </div>
             ))}
           </div>

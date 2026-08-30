@@ -72,7 +72,7 @@ export default function LargeFiles() {
                   <td>{f.modified_at ? new Date(f.modified_at).toLocaleDateString() : "--"}</td>
                   <td>{formatBytes(f.logical_size)}</td>
                   <td>
-                    <button onClick={() => api.revealPath(f.path)}>Reveal</button>
+                    <button onClick={() => api.revealInFileManager(f.path)}>Reveal</button>
                   </td>
                 </tr>
               ))}

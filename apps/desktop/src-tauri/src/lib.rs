@@ -118,12 +118,24 @@ struct ScanSummary {
 /// scan's memory bounded. Periodically persists the partial aggregate map
 /// and emits events so the UI shows real results within seconds, not only
 /// after the entire tree finishes.
+// Benchmarked (crates/core/examples/db_bench.rs): raising the DB insert
+// transaction size from the scanner's 1024-entry UI/cancellation batch to
+// 10,000 measured ~46.7k rows/sec vs ~22.4k rows/sec at 300k synthetic rows
+// -- batch size was the dominant lever for insertion throughput (far more
+// than journal mode or synchronous setting), so the DB write batch is
+// deliberately decoupled from the scanner's batch: cancellation/progress
+// stay responsive at 1024 entries, while SQLite inserts are buffered up to
+// this size before a transaction commits.
+const DB_INSERT_BATCH_SIZE: usize = 10_000;
+
 struct StreamingSink {
     app: tauri::AppHandle,
     db: Arc<Mutex<StorageDatabase>>,
     scan_id: Uuid,
     root: PathBuf,
     aggregates: HashMap<PathBuf, DirectoryAggregate>,
+    pending_for_db: Vec<FileEntry>,
+    rows_committed: u64,
     start: Instant,
     last_progress_emit: Instant,
     last_dashboard_persist: Instant,
@@ -140,12 +152,26 @@ impl StreamingSink {
             scan_id,
             root,
             aggregates: HashMap::new(),
+            pending_for_db: Vec::with_capacity(DB_INSERT_BATCH_SIZE),
+            rows_committed: 0,
             start: now,
             last_progress_emit: now,
             last_dashboard_persist: now,
             current_path: None,
             time_to_first_result_ms: None,
         }
+    }
+
+    fn flush_db(&mut self) {
+        if self.pending_for_db.is_empty() {
+            return;
+        }
+        if let Ok(mut db) = self.db.lock() {
+            if db.insert_entries(&self.pending_for_db).is_ok() {
+                self.rows_committed += self.pending_for_db.len() as u64;
+            }
+        }
+        self.pending_for_db.clear();
     }
 }
 
@@ -167,14 +193,17 @@ impl ScanProgressSink for StreamingSink {
             self.current_path = last.parent.clone().or_else(|| Some(last.path.clone()));
         }
 
-        // One transaction per batch (StorageDatabase::insert_entries wraps
-        // its own call in a transaction) -- never one transaction for the
-        // whole scan, and never held open longer than a single batch.
-        if let Ok(mut db) = self.db.lock() {
-            let _ = db.insert_entries(&entries);
-        }
-
         fold_into(&mut self.aggregates, &self.root, &entries);
+
+        // Buffered up to DB_INSERT_BATCH_SIZE, then one transaction per
+        // flush -- never one transaction for the whole scan, and never a
+        // transaction per tiny 1024-entry scanner batch either (see
+        // DB_INSERT_BATCH_SIZE's comment for the throughput data behind
+        // this choice).
+        self.pending_for_db.extend(entries);
+        if self.pending_for_db.len() >= DB_INSERT_BATCH_SIZE {
+            self.flush_db();
+        }
 
         if self.last_dashboard_persist.elapsed() > Duration::from_millis(1500) {
             if let Ok(mut db) = self.db.lock() {
@@ -210,7 +239,9 @@ impl ScanProgressSink for StreamingSink {
         self.last_progress_emit = Instant::now();
     }
 
-    fn on_complete(&mut self, _stats: &ScanStats) {}
+    fn on_complete(&mut self, _stats: &ScanStats) {
+        self.flush_db();
+    }
 }
 
 #[tauri::command]
@@ -394,6 +425,96 @@ fn get_directory_children(
     db.directory_children(scan_id, Path::new(&path)).map_err(|e| e.to_string())
 }
 
+// -- treemap: aggregated-hierarchy API -----------------------------------
+//
+// Never ships raw FileEntry dumps to the frontend. For a given directory,
+// returns only that directory's immediate children (subdirectories as
+// pre-aggregated totals, plus direct files), capped at TREEMAP_MAX_CHILDREN
+// with the remainder folded into a synthetic "Other" bucket -- so this
+// scales to a directory with hundreds of thousands of descendants without
+// ever asking React to render (or even receive) that many objects. Drilling
+// into a child directory is a fresh call to this same command.
+
+const TREEMAP_MAX_CHILDREN: usize = 40;
+
+#[derive(Clone, serde::Serialize)]
+struct TreemapChild {
+    name: String,
+    path: String,
+    size: u64,
+    #[serde(rename = "type")]
+    kind: String,
+    child_count: u64,
+    modified_at: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct TreemapNode {
+    path: String,
+    total_size: u64,
+    children: Vec<TreemapChild>,
+}
+
+#[tauri::command]
+fn get_treemap_node(state: tauri::State<AppState>, scan_id: String, path: String) -> Result<TreemapNode, String> {
+    let scan_id = parse_scan_id(&scan_id)?;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let path_buf = PathBuf::from(&path);
+
+    let total_size = db
+        .directory_aggregate(scan_id, &path_buf)
+        .map_err(|e| e.to_string())?
+        .map(|a| a.total_size)
+        .unwrap_or(0);
+
+    let dir_children = db.directory_children(scan_id, &path_buf).map_err(|e| e.to_string())?;
+    let file_children = db.file_children(scan_id, &path_buf).map_err(|e| e.to_string())?;
+
+    let mut all: Vec<TreemapChild> = Vec::with_capacity(dir_children.len() + file_children.len());
+    for d in &dir_children {
+        let name = d.path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+        all.push(TreemapChild {
+            name,
+            path: d.path.to_string_lossy().to_string(),
+            size: d.total_size,
+            kind: "directory".to_string(),
+            child_count: d.file_count + d.dir_count,
+            modified_at: d.latest_modified.map(|dt| dt.to_rfc3339()),
+        });
+    }
+    for f in &file_children {
+        let name = f.path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+        all.push(TreemapChild {
+            name,
+            path: f.path.to_string_lossy().to_string(),
+            size: f.logical_size,
+            kind: "file".to_string(),
+            child_count: 0,
+            modified_at: f.modified_at.map(|dt| dt.to_rfc3339()),
+        });
+    }
+    all.sort_by(|a, b| b.size.cmp(&a.size));
+
+    let children = if all.len() > TREEMAP_MAX_CHILDREN {
+        let (visible, rest) = all.split_at(TREEMAP_MAX_CHILDREN - 1);
+        let mut visible = visible.to_vec();
+        let other_size: u64 = rest.iter().map(|c| c.size).sum();
+        visible.push(TreemapChild {
+            name: format!("Other ({} items)", rest.len()),
+            path: format!("{path}::__other__"),
+            size: other_size,
+            kind: "other".to_string(),
+            child_count: rest.len() as u64,
+            modified_at: None,
+        });
+        visible
+    } else {
+        all
+    };
+
+    Ok(TreemapNode { path, total_size, children })
+}
+
 #[tauri::command]
 fn get_large_files(
     state: tauri::State<AppState>,
@@ -558,8 +679,41 @@ fn get_developer_storage(state: tauri::State<AppState>, scan_id: String) -> Resu
     Ok(totals.into_iter().filter(|t| DEVELOPER_CATEGORY_IDS.contains(&t.category_id.as_str())).collect())
 }
 
+// -- platform abstraction (spec: "both platforms first-class, UI calls
+// semantic operations, never OS-specific terminology") ------------------
+
+#[derive(serde::Serialize)]
+struct PlatformInfo {
+    os: &'static str, // "windows" | "macos"
+    os_family_label: &'static str, // "Windows" | "macOS"
+    file_manager_label: &'static str, // "Explorer" | "Finder"
+    trash_label: &'static str, // "Recycle Bin" | "Trash"
+    arch: String,
+}
+
 #[tauri::command]
-fn reveal_path(path: String) -> Result<(), String> {
+fn get_platform_info() -> PlatformInfo {
+    #[cfg(target_os = "windows")]
+    let info = PlatformInfo {
+        os: "windows",
+        os_family_label: "Windows",
+        file_manager_label: "Explorer",
+        trash_label: "Recycle Bin",
+        arch: std::env::consts::ARCH.to_string(),
+    };
+    #[cfg(target_os = "macos")]
+    let info = PlatformInfo {
+        os: "macos",
+        os_family_label: "macOS",
+        file_manager_label: "Finder",
+        trash_label: "Trash",
+        arch: std::env::consts::ARCH.to_string(),
+    };
+    info
+}
+
+#[tauri::command]
+fn reveal_in_file_manager(path: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         std::process::Command::new("explorer")
@@ -597,6 +751,7 @@ pub fn run() {
             get_scan_status,
             get_dashboard,
             get_directory_children,
+            get_treemap_node,
             get_large_files,
             get_recommendations,
             get_duplicates,
@@ -607,7 +762,8 @@ pub fn run() {
             list_installed_apps,
             get_app_associations,
             get_developer_storage,
-            reveal_path,
+            reveal_in_file_manager,
+            get_platform_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,27 +1,87 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { useScan } from "../store/ScanContext";
-import { api, formatBytes, DirectoryAggregate } from "../api";
+import { useManualBasket } from "../store/ManualBasketContext";
+import { api, formatBytes, TreemapChild, TreemapNode } from "../api";
+import Treemap from "../components/Treemap";
+import ContextMenu, { ContextMenuItem } from "../components/ContextMenu";
+
+type SortKey = "size" | "name" | "modified" | "items";
+
+function splitPath(path: string): string[] {
+  return path.split(/[\\/]/).filter(Boolean);
+}
 
 export default function Storage() {
-  const { dashboard } = useScan();
+  const { dashboard, status } = useScan();
+  const basket = useManualBasket();
   const [path, setPath] = useState<string | null>(null);
-  const [children, setChildren] = useState<DirectoryAggregate[]>([]);
+  const [node, setNode] = useState<TreemapNode | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [sortKey, setSortKey] = useState<SortKey>("size");
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; child: TreemapChild } | null>(null);
 
   useEffect(() => {
-    if (dashboard) setPath(dashboard.root);
-  }, [dashboard]);
-
-  useEffect(() => {
-    if (!dashboard || !path) return;
-    setLoading(true);
-    api
-      .getDirectoryChildren(dashboard.scan_id, path)
-      .then(setChildren)
-      .catch((e) => setError(String(e)))
-      .finally(() => setLoading(false));
+    if (dashboard && !path) setPath(dashboard.root);
   }, [dashboard, path]);
+
+  const load = useCallback(async () => {
+    if (!dashboard || !path) return;
+    try {
+      const data = await api.getTreemapNode(dashboard.scan_id, path);
+      setNode(data);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [dashboard, path]);
+
+  useEffect(() => {
+    setLoading(true);
+    load();
+  }, [load]);
+
+  // Progressive treemap: re-fetch the current node whenever the backend
+  // persists a new partial aggregate snapshot (throttled server-side to
+  // ~1.5s) so the view updates a few times per second at most, never
+  // reshuffling on every filesystem event.
+  useEffect(() => {
+    const unlisten = listen("dashboard-updated", () => {
+      if (status === "scanning" || status === "starting") load();
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, [load, status]);
+
+  const drill = useCallback((child: TreemapChild) => {
+    if (child.type !== "directory") return;
+    setPath(child.path);
+    setSelectedPath(null);
+  }, []);
+
+  const sortedChildren = useMemo(() => {
+    if (!node) return [];
+    const items = [...node.children];
+    items.sort((a, b) => {
+      switch (sortKey) {
+        case "name":
+          return a.name.localeCompare(b.name);
+        case "modified":
+          return (b.modified_at ?? "").localeCompare(a.modified_at ?? "");
+        case "items":
+          return b.child_count - a.child_count;
+        case "size":
+        default:
+          return b.size - a.size;
+      }
+    });
+    return items;
+  }, [node, sortKey]);
 
   if (!dashboard) {
     return (
@@ -32,63 +92,117 @@ export default function Storage() {
     );
   }
 
-  const parts = path?.split(/[\/]/).filter(Boolean) ?? [];
-  const maxSize = Math.max(1, ...children.map((c) => c.total_size));
+  const crumbs = path ? splitPath(path) : [];
+  const rootCrumbCount = path ? splitPath(dashboard.root).length : 0;
+
+  function contextMenuItems(child: TreemapChild): ContextMenuItem[] {
+    const items: ContextMenuItem[] = [];
+    if (child.type !== "other") {
+      items.push({ label: "Reveal in File Manager", onClick: () => api.revealInFileManager(child.path) });
+    }
+    if (child.type === "directory") {
+      items.push({ label: "Open (Zoom In)", onClick: () => drill(child) });
+    }
+    items.push({
+      label: "Copy Path",
+      onClick: () => navigator.clipboard?.writeText(child.path),
+    });
+    if (child.type !== "other") {
+      items.push({
+        label: "Add to Cleanup",
+        onClick: () =>
+          basket.add({
+            category_id: "manual",
+            display_name: child.name,
+            paths: [child.path],
+            total_size: child.size,
+            safety: "Review",
+          }),
+      });
+    }
+    return items;
+  }
 
   return (
     <div>
       <h1 className="page-title">Storage</h1>
-      <p className="page-subtitle">Drill down through {dashboard.root} to see what is using space.</p>
+      <p className="page-subtitle">Drill into {dashboard.root} to see what is using space.</p>
 
       {error && <div className="error-banner">{error}</div>}
 
       <div className="breadcrumbs">
-        <button onClick={() => setPath(dashboard.root)}>{dashboard.root}</button>
-        {path && path !== dashboard.root && <span> / {parts[parts.length - 1]}</span>}
+        {crumbs.map((part, i) => {
+          const targetPath = i === 0 ? crumbs[0] + (part.endsWith(":") ? "\\" : "") : crumbs.slice(0, i + 1).join("\\");
+          const isLast = i === crumbs.length - 1;
+          const isBelowRoot = i < rootCrumbCount - 1;
+          if (isBelowRoot) return null;
+          return (
+            <span key={i}>
+              {i > rootCrumbCount - 1 && " > "}
+              {isLast ? <strong>{part}</strong> : <button onClick={() => setPath(targetPath)}>{part}</button>}
+            </span>
+          );
+        })}
       </div>
 
-      <div className="card">
-        {loading && <div className="empty-state">Loading...</div>}
-        {!loading && children.length === 0 && <div className="empty-state">No subdirectories here.</div>}
-        {!loading && children.length > 0 && (
-          <table>
-            <thead>
+      <Treemap
+        children={node?.children ?? []}
+        selectedPath={selectedPath}
+        onSelect={(child) => setSelectedPath(child.path)}
+        onDrill={drill}
+        onContextMenu={(child, x, y) => {
+          setSelectedPath(child.path);
+          setContextMenu({ x, y, child });
+        }}
+      />
+      {loading && <div style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 6 }}>Updating...</div>}
+
+      {contextMenu && (
+        <ContextMenu x={contextMenu.x} y={contextMenu.y} items={contextMenuItems(contextMenu.child)} onClose={() => setContextMenu(null)} />
+      )}
+
+      <div className="card" style={{ marginTop: 20 }}>
+        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+          {(["size", "name", "modified", "items"] as SortKey[]).map((key) => (
+            <button key={key} className={sortKey === key ? "primary" : ""} onClick={() => setSortKey(key)}>
+              Sort by {key}
+            </button>
+          ))}
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Size</th>
+              <th>% of parent</th>
+              <th>Items</th>
+              <th>Modified</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sortedChildren.length === 0 && (
               <tr>
-                <th>Name</th>
-                <th>Files</th>
-                <th>Size</th>
-                <th></th>
+                <td colSpan={5} className="empty-state">
+                  Nothing here yet.
+                </td>
               </tr>
-            </thead>
-            <tbody>
-              {children.map((c) => {
-                const name = c.path.split(/[\/]/).filter(Boolean).pop() ?? c.path;
-                const pct = Math.round((c.total_size / maxSize) * 100);
-                return (
-                  <tr key={c.path}>
-                    <td>
-                      <button onClick={() => setPath(c.path)} style={{ border: "none", background: "none", padding: 0, color: "var(--text)", cursor: "pointer", textAlign: "left" }}>
-                        {name}
-                      </button>
-                    </td>
-                    <td>{c.file_count}</td>
-                    <td style={{ minWidth: 220 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <div style={{ flex: 1, height: 6, background: "var(--hover-bg)", borderRadius: 3, overflow: "hidden" }}>
-                          <div style={{ width: `${pct}%`, height: "100%", background: "var(--accent)" }} />
-                        </div>
-                        <span style={{ whiteSpace: "nowrap" }}>{formatBytes(c.total_size)}</span>
-                      </div>
-                    </td>
-                    <td>
-                      <button onClick={() => api.revealPath(c.path)}>Reveal</button>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
+            )}
+            {sortedChildren.map((c) => (
+              <tr
+                key={c.path}
+                onClick={() => setSelectedPath(c.path)}
+                onDoubleClick={() => drill(c)}
+                style={{ cursor: "pointer", background: selectedPath === c.path ? "var(--hover-bg)" : undefined }}
+              >
+                <td>{c.name}</td>
+                <td>{formatBytes(c.size)}</td>
+                <td>{node && node.total_size > 0 ? ((c.size / node.total_size) * 100).toFixed(1) : "0"}%</td>
+                <td>{c.type === "file" ? "--" : c.child_count}</td>
+                <td>{c.modified_at ? new Date(c.modified_at).toLocaleDateString() : "--"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
     </div>
   );

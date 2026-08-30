@@ -180,15 +180,6 @@ button:disabled {
   font-size: 13px;
 }
 
-.treemap {
-  position: relative;
-  width: 100%;
-  height: 480px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  overflow: hidden;
-}
-
 .spinner {
   display: inline-block;
   width: 14px;
@@ -203,13 +194,3 @@ button:disabled {
   to { transform: rotate(360deg); }
 }
 
-.treemap-cell {
-  position: absolute;
-  border: 1px solid var(--panel-bg);
-  overflow: hidden;
-  padding: 4px 6px;
-  font-size: 11.5px;
-  color: white;
-  cursor: pointer;
-  text-shadow: 0 1px 2px rgba(0,0,0,0.4);
-}

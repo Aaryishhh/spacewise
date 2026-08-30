@@ -1,0 +1,81 @@
+.treemap {
+  position: relative;
+  width: 100%;
+  height: 480px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--panel-bg);
+}
+
+.treemap-cell {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  overflow: hidden;
+  padding: 3px 6px;
+  cursor: pointer;
+  transition: filter 0.1s ease;
+}
+
+.treemap-cell:hover {
+  filter: brightness(1.12);
+  z-index: 2;
+}
+
+.treemap-cell.selected {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  z-index: 3;
+}
+
+.treemap-label {
+  font-size: 11.5px;
+  color: white;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+}
+
+.treemap-tooltip {
+  position: absolute;
+  bottom: 10px;
+  left: 10px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+  max-width: 320px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+  pointer-events: none;
+  z-index: 10;
+}
+
+.context-menu {
+  position: fixed;
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.2);
+  padding: 4px;
+  z-index: 100;
+  min-width: 160px;
+}
+
+.context-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: none;
+  padding: 7px 10px;
+  border-radius: 5px;
+  font-size: 13px;
+}
+
+.context-menu button:hover {
+  background: var(--hover-bg);
+}

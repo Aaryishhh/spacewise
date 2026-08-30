@@ -56,6 +56,23 @@ export interface DashboardData {
   category_totals: CategoryTotal[];
 }
 
+export type TreemapChildType = "directory" | "file" | "other";
+
+export interface TreemapChild {
+  name: string;
+  path: string;
+  size: number;
+  type: TreemapChildType;
+  child_count: number;
+  modified_at: string | null;
+}
+
+export interface TreemapNode {
+  path: string;
+  total_size: number;
+  children: TreemapChild[];
+}
+
 export interface DirectoryAggregate {
   path: string;
   total_size: number;
@@ -155,6 +172,7 @@ export const api = {
   getDashboard: () => invoke<DashboardData | null>("get_dashboard"),
   getDirectoryChildren: (scanId: string, path: string) =>
     invoke<DirectoryAggregate[]>("get_directory_children", { scanId, path }),
+  getTreemapNode: (scanId: string, path: string) => invoke<TreemapNode>("get_treemap_node", { scanId, path }),
   getLargeFiles: (scanId: string, minSizeBytes: number, olderThanDays?: number) =>
     invoke<FileEntry[]>("get_large_files", { scanId, minSizeBytes, olderThanDays: olderThanDays ?? null }),
   getRecommendations: (scanId: string) => invoke<Recommendation[]>("get_recommendations", { scanId }),
@@ -165,7 +183,7 @@ export const api = {
   listInstalledApps: () => invoke<InstalledApp[]>("list_installed_apps"),
   getAppAssociations: (scanId: string) => invoke<AppAssociation[]>("get_app_associations", { scanId }),
   getDeveloperStorage: (scanId: string) => invoke<CategoryTotal[]>("get_developer_storage", { scanId }),
-  revealPath: (path: string) => invoke<void>("reveal_path", { path }),
+  revealInFileManager: (path: string) => invoke<void>("reveal_in_file_manager", { path }),
 };
 
 export function formatBytes(bytes: number): string {

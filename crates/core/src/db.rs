@@ -338,6 +338,18 @@ impl StorageDatabase {
         Ok(())
     }
 
+    /// Direct file (non-directory) children of `parent` -- used alongside
+    /// directory_children to build a treemap node's full children list
+    /// without ever shipping the whole scan's FileEntry table anywhere.
+    pub fn file_children(&self, scan_id: Uuid, parent: &Path) -> anyhow::Result<Vec<FileEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, scan_id, path, parent, logical_size, allocated_size, extension, created_at, modified_at, accessed_at, is_dir, is_symlink, is_hardlink, is_hidden, is_system, filesystem_id
+             FROM file_entries WHERE scan_id = ?1 AND parent = ?2 AND is_dir = 0",
+        )?;
+        let rows = stmt.query_map(params![scan_id.to_string(), path_str(parent)], row_to_file_entry)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn directory_children(&self, scan_id: Uuid, parent: &Path) -> anyhow::Result<Vec<DirectoryAggregate>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, total_size, allocated_size, file_count, dir_count, latest_modified
