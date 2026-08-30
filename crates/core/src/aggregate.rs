@@ -2,22 +2,37 @@
 //! file's size is added to each of its ancestor directories, so a treemap or
 //! directory-explorer view can render totals at any depth without re-walking
 //! the filesystem.
+//!
+//! `fold_into` is the streaming-safe entry point: it mutates an existing
+//! aggregate map with one batch of entries at a time, so the caller never
+//! needs to hold the full FileEntry list in memory -- the map itself is
+//! O(unique directories seen), not O(total files), which is what actually
+//! keeps a multi-million-file scan's memory bounded.
 
 use crate::model::{DirectoryAggregate, FileEntry};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub fn aggregate_directories(root: &Path, entries: &[FileEntry]) -> HashMap<PathBuf, DirectoryAggregate> {
-    let mut aggregates: HashMap<PathBuf, DirectoryAggregate> = HashMap::new();
+    let mut aggregates = HashMap::new();
+    fold_into(&mut aggregates, root, entries);
+    aggregates
+}
 
+pub fn fold_into(aggregates: &mut HashMap<PathBuf, DirectoryAggregate>, root: &Path, entries: &[FileEntry]) {
     for entry in entries {
         if entry.is_dir {
             aggregates
                 .entry(entry.path.clone())
-                .or_insert_with(|| DirectoryAggregate {
-                    path: entry.path.clone(),
-                    ..Default::default()
-                });
+                .or_insert_with(|| DirectoryAggregate { path: entry.path.clone(), ..Default::default() });
+            // dir_count is incremented on the parent as soon as we see this
+            // directory itself -- one pass, no second sweep over all entries.
+            if let Some(parent) = entry.parent.as_deref() {
+                let parent_agg = aggregates
+                    .entry(parent.to_path_buf())
+                    .or_insert_with(|| DirectoryAggregate { path: parent.to_path_buf(), ..Default::default() });
+                parent_agg.dir_count += 1;
+            }
             continue;
         }
 
@@ -28,10 +43,7 @@ pub fn aggregate_directories(root: &Path, entries: &[FileEntry]) -> HashMap<Path
         while let Some(dir) = ancestor {
             let agg = aggregates
                 .entry(dir.to_path_buf())
-                .or_insert_with(|| DirectoryAggregate {
-                    path: dir.to_path_buf(),
-                    ..Default::default()
-                });
+                .or_insert_with(|| DirectoryAggregate { path: dir.to_path_buf(), ..Default::default() });
             agg.total_size += entry.logical_size;
             agg.allocated_size += entry.allocated_size;
             agg.file_count += 1;
@@ -46,23 +58,6 @@ pub fn aggregate_directories(root: &Path, entries: &[FileEntry]) -> HashMap<Path
             ancestor = dir.parent();
         }
     }
-
-    // dir_count: number of immediate subdirectories, needed by the UI to
-    // show "N items" without a second query.
-    let dir_paths: Vec<PathBuf> = entries
-        .iter()
-        .filter(|e| e.is_dir)
-        .map(|e| e.path.clone())
-        .collect();
-    for dir_path in &dir_paths {
-        if let Some(parent) = dir_path.parent() {
-            if let Some(agg) = aggregates.get_mut(parent) {
-                agg.dir_count += 1;
-            }
-        }
-    }
-
-    aggregates
 }
 
 #[cfg(test)]
@@ -108,5 +103,20 @@ mod tests {
         // "/root/a" contains f2.bin directly and f1.bin via "/root/a/b".
         assert_eq!(agg[&PathBuf::from("/root/a")].file_count, 2);
         assert_eq!(agg[&PathBuf::from("/root/a/b")].file_count, 1);
+    }
+
+    #[test]
+    fn folding_multiple_batches_matches_folding_all_at_once() {
+        let batch1 = vec![file("/root/a/f1.bin", "/root/a", 10)];
+        let batch2 = vec![file("/root/a/f2.bin", "/root/a", 20)];
+
+        let mut streamed = HashMap::new();
+        fold_into(&mut streamed, Path::new("/root"), &batch1);
+        fold_into(&mut streamed, Path::new("/root"), &batch2);
+
+        let all_at_once = aggregate_directories(Path::new("/root"), &[batch1, batch2].concat());
+
+        assert_eq!(streamed[&PathBuf::from("/root/a")].total_size, all_at_once[&PathBuf::from("/root/a")].total_size);
+        assert_eq!(streamed[&PathBuf::from("/root/a")].file_count, all_at_once[&PathBuf::from("/root/a")].file_count);
     }
 }

@@ -109,6 +109,7 @@ impl StorageDatabase {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path)?;
         let db = Self { conn };
+        db.configure()?;
         db.migrate()?;
         Ok(db)
     }
@@ -118,6 +119,27 @@ impl StorageDatabase {
         let db = Self { conn };
         db.migrate()?;
         Ok(db)
+    }
+
+    /// Performance pragmas for a scan that inserts hundreds of thousands to
+    /// millions of rows: WAL lets progressive dashboard reads run
+    /// concurrently with the scan's writes instead of blocking on them
+    /// (spec: "avoid expensive queries during the active scan" -- WAL is
+    /// what makes read queries during the scan cheap in the first place,
+    /// rather than us having to avoid running them at all). synchronous=
+    /// NORMAL is the standard safe pairing with WAL (still durable across
+    /// an application crash, just not against an OS-level power loss mid
+    /// write, an acceptable tradeoff for a local cache database that is
+    /// always rebuilt by rescanning). Not applied to the in-memory test DB,
+    /// which has no file to journal.
+    fn configure(&self) -> anyhow::Result<()> {
+        self.conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA cache_size = -32000;",
+        )?;
+        Ok(())
     }
 
     fn migrate(&self) -> anyhow::Result<()> {

@@ -2,21 +2,52 @@
 //! inherently tree-shaped and hard to parallelize safely across platforms),
 //! then stats each batch of paths in parallel with `rayon` (the actually
 //! expensive I/O). Streams results to a `ScanProgressSink` in batches so the
-//! UI can render before the full scan completes.
+//! caller never has to buffer the whole tree, and checks a `CancellationToken`
+//! between batches so a scan can be stopped promptly and the caller regains
+//! control immediately.
 //!
 //! Cycle protection: every visited directory's platform file-id (device+inode
 //! on Unix, volume+file-index on Windows) is recorded in a visited-set via
 //! `filter_entry`, so a symlink loop or an NTFS junction pointing back at an
 //! ancestor can not cause infinite recursion or double-counted size.
+//!
+//! Robustness: a single unreadable/vanished/permission-denied entry never
+//! aborts the scan -- it is counted and recorded as a `SkippedItem` and the
+//! walk continues. `symlink_metadata` (never `metadata`) is used throughout
+//! so a broken symlink, a file that disappears between readdir and stat, or
+//! a reparse point can not hang or panic the scan.
 
 use crate::model::FileEntry;
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 use uuid::Uuid;
 use walkdir::WalkDir;
+
+/// Cheap, cloneable, thread-safe cancellation flag. Checked between batches
+/// (not per-entry, to avoid an atomic load per file) so cancellation takes
+/// effect within one batch (`ScanOptions::batch_size` entries), typically a
+/// few hundred milliseconds even on a fast local disk.
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -27,35 +58,63 @@ pub struct ScanOptions {
     /// same id they used there, or queries by scan_id will silently match
     /// nothing.
     pub scan_id: Uuid,
+    pub cancel_token: CancellationToken,
 }
 
 impl ScanOptions {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), batch_size: 1024, scan_id: Uuid::new_v4() }
+        Self { root: root.into(), batch_size: 1024, scan_id: Uuid::new_v4(), cancel_token: CancellationToken::new() }
     }
 
     pub fn with_scan_id(root: impl Into<PathBuf>, scan_id: Uuid) -> Self {
-        Self { root: root.into(), batch_size: 1024, scan_id }
+        Self { root: root.into(), batch_size: 1024, scan_id, cancel_token: CancellationToken::new() }
+    }
+
+    pub fn with_cancel_token(mut self, token: CancellationToken) -> Self {
+        self.cancel_token = token;
+        self
     }
 }
+
+/// One filesystem entry the walker could not process, with the reason, so
+/// the user can review what was skipped instead of being told a scary raw
+/// I/O error. Capped in ScanStats to a bounded sample -- `skipped_total`
+/// still counts every occurrence.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SkippedItem {
+    pub path: Option<PathBuf>,
+    pub reason: String,
+}
+
+const MAX_TRACKED_SKIPS: usize = 500;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ScanStats {
     pub files_scanned: u64,
     pub dirs_scanned: u64,
     pub total_logical_size: u64,
+    /// Deprecated alias for skipped_total, kept so any existing caller
+    /// reading `.errors` still compiles; new code should use skipped_total.
     pub errors: u64,
+    pub skipped_total: u64,
+    pub skipped_sample: Vec<SkippedItem>,
     pub duration_ms: u64,
+    pub cancelled: bool,
 }
 
 pub trait ScanProgressSink: Send {
     fn on_entries(&mut self, entries: Vec<FileEntry>);
+    /// Called once per batch with the running totals so a caller can stream
+    /// progress without recomputing sums itself. Default no-op keeps
+    /// existing sinks (tests, CLI) compiling unchanged.
+    fn on_progress(&mut self, _stats: &ScanStats) {}
     fn on_complete(&mut self, stats: &ScanStats);
 }
 
 /// Sink that just accumulates everything in memory. Useful for tests, small
-/// scans, and CLI tools; the desktop app uses a sink that streams into
-/// StorageDatabase instead so memory stays bounded on huge trees.
+/// scans, and CLI tools; the desktop app streams straight into
+/// StorageDatabase per batch instead so memory stays bounded (O(unique
+/// directories), not O(total files)) on huge trees.
 #[derive(Default)]
 pub struct CollectingSink {
     pub entries: Vec<FileEntry>,
@@ -104,18 +163,27 @@ impl Scanner {
         for entry_result in walker {
             let entry = match entry_result {
                 Ok(e) => e,
-                Err(_) => {
-                    stats.errors += 1;
+                Err(err) => {
+                    record_skip(&mut stats, err.path().map(|p| p.to_path_buf()), skip_reason(&err));
                     continue;
                 }
             };
             pending.push(entry.into_path());
             if pending.len() >= batch_size {
                 flush_batch(scan_id, &mut pending, &mut stats, sink);
+                sink.on_progress(&stats);
+                if options.cancel_token.is_cancelled() {
+                    stats.cancelled = true;
+                    break;
+                }
             }
         }
-        if !pending.is_empty() {
-            flush_batch(scan_id, &mut pending, &mut stats, sink);
+        if !stats.cancelled && !pending.is_empty() {
+            if options.cancel_token.is_cancelled() {
+                stats.cancelled = true;
+            } else {
+                flush_batch(scan_id, &mut pending, &mut stats, sink);
+            }
         }
 
         stats.duration_ms = start.elapsed().as_millis() as u64;
@@ -130,6 +198,24 @@ impl Default for Scanner {
     }
 }
 
+fn skip_reason(err: &walkdir::Error) -> String {
+    if let Some(io_err) = err.io_error() {
+        io_err.to_string()
+    } else if err.loop_ancestor().is_some() {
+        "filesystem loop detected".to_string()
+    } else {
+        err.to_string()
+    }
+}
+
+fn record_skip(stats: &mut ScanStats, path: Option<PathBuf>, reason: String) {
+    stats.errors += 1;
+    stats.skipped_total += 1;
+    if stats.skipped_sample.len() < MAX_TRACKED_SKIPS {
+        stats.skipped_sample.push(SkippedItem { path, reason });
+    }
+}
+
 fn flush_batch(
     scan_id: Uuid,
     pending: &mut Vec<PathBuf>,
@@ -137,10 +223,14 @@ fn flush_batch(
     sink: &mut dyn ScanProgressSink,
 ) {
     let paths = std::mem::take(pending);
-    let entries: Vec<FileEntry> = paths
-        .into_par_iter()
-        .filter_map(|path| build_entry(scan_id, path))
-        .collect();
+    let mut entries: Vec<FileEntry> = Vec::with_capacity(paths.len());
+    let results: Vec<Result<FileEntry, (PathBuf, String)>> = paths.into_par_iter().map(build_entry_checked(scan_id)).collect();
+    for r in results {
+        match r {
+            Ok(e) => entries.push(e),
+            Err((path, reason)) => record_skip(stats, Some(path), reason),
+        }
+    }
 
     for e in &entries {
         if e.is_dir {
@@ -153,40 +243,42 @@ fn flush_batch(
     sink.on_entries(entries);
 }
 
-fn build_entry(scan_id: Uuid, path: PathBuf) -> Option<FileEntry> {
-    // symlink_metadata: never follows the link, so a broken/looping symlink
-    // can not hang the scan -- we report the link's own size/type.
-    let meta = std::fs::symlink_metadata(&path).ok()?;
-    let is_dir = meta.is_dir();
-    Some(FileEntry {
-        id: Uuid::new_v4(),
-        scan_id,
-        parent: path.parent().map(|p| p.to_path_buf()),
-        extension: path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s.to_ascii_lowercase()),
-        is_dir,
-        is_symlink: meta.file_type().is_symlink(),
-        is_hardlink: is_hardlink(&meta),
-        is_hidden: is_hidden(&path),
-        // Real system-file detection lives in the classification engine
-        // (Phase 6), which knows platform-specific protected roots.
-        is_system: false,
-        filesystem_id: same_file::Handle::from_path(&path)
-            .ok()
-            .map(|h| format!("{:?}", h)),
-        logical_size: meta.len(),
-        // Real allocated/on-disk size (accounting for sparse files, APFS
-        // clones, NTFS compression) is enriched later via
-        // PlatformAdapter::enrich_metadata; this is a safe upper-bound
-        // approximation so downstream code always has a value.
-        allocated_size: meta.len(),
-        created_at: meta.created().ok().map(to_datetime),
-        modified_at: meta.modified().ok().map(to_datetime),
-        accessed_at: meta.accessed().ok().map(to_datetime),
-        path,
-    })
+fn build_entry_checked(scan_id: Uuid) -> impl Fn(PathBuf) -> Result<FileEntry, (PathBuf, String)> {
+    move |path: PathBuf| {
+        // symlink_metadata: never follows the link, so a broken/looping
+        // symlink, a reparse point, or a file that disappeared between
+        // readdir and stat can not hang or panic the scan -- it is reported
+        // as a skip with the real OS error instead.
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| (path.clone(), e.to_string()))?;
+        let is_dir = meta.is_dir();
+        Ok(FileEntry {
+            id: Uuid::new_v4(),
+            scan_id,
+            parent: path.parent().map(|p| p.to_path_buf()),
+            extension: path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_ascii_lowercase()),
+            is_dir,
+            is_symlink: meta.file_type().is_symlink(),
+            is_hardlink: is_hardlink(&meta),
+            is_hidden: is_hidden(&path),
+            // Real system-file detection lives in the classification engine
+            // (Phase 6), which knows platform-specific protected roots.
+            is_system: false,
+            filesystem_id: same_file::Handle::from_path(&path).ok().map(|h| format!("{:?}", h)),
+            logical_size: meta.len(),
+            // Real allocated/on-disk size (accounting for sparse files, APFS
+            // clones, NTFS compression) is enriched later via
+            // PlatformAdapter::enrich_metadata; this is a safe upper-bound
+            // approximation so downstream code always has a value.
+            allocated_size: meta.len(),
+            created_at: meta.created().ok().map(to_datetime),
+            modified_at: meta.modified().ok().map(to_datetime),
+            accessed_at: meta.accessed().ok().map(to_datetime),
+            path,
+        })
+    }
 }
 
 fn to_datetime(t: SystemTime) -> DateTime<Utc> {
@@ -271,5 +363,64 @@ mod tests {
         let mut sink = CollectingSink::default();
         let result = Scanner::new().scan(&ScanOptions::new(dir.path()), &mut sink);
         assert!(result.is_ok(), "scan must terminate, not hang or error out");
+    }
+
+    #[test]
+    fn cancellation_stops_the_scan_and_reports_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..50 {
+            fs::write(dir.path().join(format!("f{i}.bin")), vec![0u8; 10]).unwrap();
+        }
+
+        let token = CancellationToken::new();
+        token.cancel(); // pre-cancelled: must stop after at most one batch
+
+        let mut sink = CollectingSink::default();
+        let options = ScanOptions::new(dir.path()).with_cancel_token(token);
+        let stats = Scanner::new().scan(&options, &mut sink).unwrap();
+
+        assert!(stats.cancelled);
+    }
+
+    #[test]
+    fn unreadable_file_is_skipped_not_fatal() {
+        // A path that never existed must be recorded as a skip, not panic
+        // or abort a batch that also contains real entries.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("real.txt"), b"present").unwrap();
+        let ghost = dir.path().join("ghost.txt");
+
+        let scan_id = Uuid::new_v4();
+        let mut stats = ScanStats::default();
+        let mut sink = CollectingSink::default();
+        let mut pending = vec![dir.path().join("real.txt"), ghost.clone()];
+        flush_batch(scan_id, &mut pending, &mut stats, &mut sink);
+
+        assert_eq!(sink.entries.len(), 1);
+        assert_eq!(stats.skipped_total, 1);
+        assert_eq!(stats.skipped_sample[0].path.as_deref(), Some(ghost.as_path()));
+    }
+
+    #[test]
+    fn very_deep_directory_tree_does_not_overflow_or_hang() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut path = dir.path().to_path_buf();
+        for i in 0..120 {
+            path = path.join(format!("d{i}"));
+        }
+        // Windows MAX_PATH is 260 without the \\?\ prefix; this depth alone
+        // already exceeds it on a typical temp dir path, so this also
+        // exercises the "long Windows paths" edge case for free.
+        let create_result = fs::create_dir_all(&path);
+        if create_result.is_err() {
+            // Some CI/sandbox environments cap path length below what this
+            // test needs; that is an environment limit, not a scanner bug.
+            return;
+        }
+        fs::write(path.join("leaf.txt"), b"deep").ok();
+
+        let mut sink = CollectingSink::default();
+        let result = Scanner::new().scan(&ScanOptions::new(dir.path()), &mut sink);
+        assert!(result.is_ok());
     }
 }
