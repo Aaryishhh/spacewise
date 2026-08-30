@@ -16,6 +16,7 @@ pub mod model;
 pub mod recommend;
 pub mod safety;
 pub mod scanner;
+pub mod uninstall;
 
 /// Minimal proof-of-life for the Tauri <-> core bridge (Phase 1 scope only).
 /// Real status (last scan time, engine versions, etc.) lands in later phases.

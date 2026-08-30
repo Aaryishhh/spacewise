@@ -135,6 +135,9 @@ mod tests {
         fn is_protected_root(&self, path: &Path) -> bool {
             self.protected.iter().any(|p| path.starts_with(p))
         }
+        fn list_installed_apps(&self) -> anyhow::Result<Vec<crate::model::InstalledApp>> {
+            Ok(Vec::new())
+        }
     }
 
     fn candidate(paths: Vec<PathBuf>, safety: SafetyLevel) -> CleanupCandidate {

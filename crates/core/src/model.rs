@@ -130,6 +130,29 @@ pub struct DuplicateGroup {
     pub paths: Vec<PathBuf>,
 }
 
+/// An application found via the OS's installed-application registry (spec
+/// section 13).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstalledApp {
+    pub name: String,
+    pub publisher: Option<String>,
+    pub install_location: Option<PathBuf>,
+    pub estimated_size_bytes: Option<u64>,
+    pub uninstall_command: Option<String>,
+}
+
+/// An installed app matched against its supporting storage (Application
+/// Support/Caches/Preferences on macOS; AppData/ProgramData on Windows).
+/// `confidence` reflects how specifically the storage location's name
+/// matches the application's name -- never delete on a weak/absent match.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppAssociation {
+    pub app: InstalledApp,
+    pub associated_paths: Vec<PathBuf>,
+    pub associated_size: u64,
+    pub confidence: f32,
+}
+
 /// Outcome of a completed cleanup action, kept so HistoryEngine can offer
 /// undo where the underlying mechanism (Trash/Recycle Bin) supports it.
 #[derive(Debug, Clone, Serialize, Deserialize)]

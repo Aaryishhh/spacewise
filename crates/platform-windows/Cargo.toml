@@ -9,3 +9,4 @@ spacewise-core = { path = "../core" }
 anyhow.workspace = true
 
 trash.workspace = true
+winreg = "0.52"

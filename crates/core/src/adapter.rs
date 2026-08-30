@@ -1,7 +1,7 @@
 //! PlatformAdapter trait: the one seam between spacewise-core and OS-specific
 //! code (spec section 2). Implemented by spacewise-platform-{macos,windows,linux}.
 
-use crate::model::FileEntry;
+use crate::model::{FileEntry, InstalledApp};
 use std::path::Path;
 
 pub trait PlatformAdapter: Send + Sync {
@@ -15,4 +15,8 @@ pub trait PlatformAdapter: Send + Sync {
     /// Whether this path is inside a protected system root the deletion
     /// allowlist must always reject (spec section 10).
     fn is_protected_root(&self, path: &Path) -> bool;
+
+    /// Applications known to the OS's installed-application registry (spec
+    /// section 13): Windows Uninstall registry keys, or macOS /Applications.
+    fn list_installed_apps(&self) -> anyhow::Result<Vec<InstalledApp>>;
 }

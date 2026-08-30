@@ -4,7 +4,7 @@
 #![cfg(target_os = "macos")]
 
 use spacewise_core::adapter::PlatformAdapter;
-use spacewise_core::model::FileEntry;
+use spacewise_core::model::{FileEntry, InstalledApp};
 use std::path::Path;
 
 pub struct MacOSAdapter;
@@ -36,5 +36,42 @@ impl PlatformAdapter for MacOSAdapter {
             "/Volumes/Preboot",
         ];
         PROTECTED.iter().any(|p| path.starts_with(p))
+    }
+
+    /// Best-effort: lists top-level *.app bundles in /Applications. Does not
+    /// parse Info.plist for a display name/version, to keep this simple and
+    /// correct rather than guessing at plist structure with zero ability to
+    /// verify it here (no macOS hardware on this development machine --
+    /// UNVERIFIED, needs real macOS testing before shipping).
+    fn list_installed_apps(&self) -> anyhow::Result<Vec<InstalledApp>> {
+        let mut apps = Vec::new();
+        let applications_dir = Path::new("/Applications");
+        if !applications_dir.is_dir() {
+            return Ok(apps);
+        }
+        for entry in std::fs::read_dir(applications_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("app") {
+                continue;
+            }
+            let name = path
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            apps.push(InstalledApp {
+                name,
+                publisher: None,
+                install_location: Some(path),
+                estimated_size_bytes: None,
+                uninstall_command: None,
+            });
+        }
+        apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        Ok(apps)
     }
 }
