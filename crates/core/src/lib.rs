@@ -6,6 +6,7 @@
 //! recommendation never executes deletion directly.
 
 pub mod adapter;
+pub mod aggregate;
 pub mod classification;
 pub mod cleanup;
 pub mod db;

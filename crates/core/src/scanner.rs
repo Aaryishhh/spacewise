@@ -22,11 +22,20 @@ use walkdir::WalkDir;
 pub struct ScanOptions {
     pub root: PathBuf,
     pub batch_size: usize,
+    /// Identity every FileEntry this scan produces will carry. Callers that
+    /// persist results (e.g. via StorageDatabase::start_scan) must pass the
+    /// same id they used there, or queries by scan_id will silently match
+    /// nothing.
+    pub scan_id: Uuid,
 }
 
 impl ScanOptions {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), batch_size: 1024 }
+        Self { root: root.into(), batch_size: 1024, scan_id: Uuid::new_v4() }
+    }
+
+    pub fn with_scan_id(root: impl Into<PathBuf>, scan_id: Uuid) -> Self {
+        Self { root: root.into(), batch_size: 1024, scan_id }
     }
 }
 
@@ -70,7 +79,7 @@ impl Scanner {
     }
 
     pub fn scan(&self, options: &ScanOptions, sink: &mut dyn ScanProgressSink) -> anyhow::Result<ScanStats> {
-        let scan_id = Uuid::new_v4();
+        let scan_id = options.scan_id;
         let start = Instant::now();
         let mut stats = ScanStats::default();
         let batch_size = options.batch_size.max(1);
