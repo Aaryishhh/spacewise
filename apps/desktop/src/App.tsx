@@ -1,33 +1,34 @@
-import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { Route, Routes } from "react-router-dom";
+import Sidebar from "./components/Sidebar";
+import Overview from "./pages/Overview";
+import Storage from "./pages/Storage";
+import Cleanup from "./pages/Cleanup";
+import LargeFiles from "./pages/LargeFiles";
+import Duplicates from "./pages/Duplicates";
+import Applications from "./pages/Applications";
+import Developer from "./pages/Developer";
+import History from "./pages/History";
+import Settings from "./pages/Settings";
 import "./App.css";
 
-interface CoreStatus {
-  version: string;
-  phase: string;
-}
-
 function App() {
-  const [status, setStatus] = useState<CoreStatus | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    invoke<CoreStatus>("core_status")
-      .then(setStatus)
-      .catch((e) => setError(String(e)));
-  }, []);
-
   return (
-    <main className="container">
-      <h1>Spacewise</h1>
-      <p>Know what's using your space — and what's actually safe to remove.</p>
-      {error && <p className="error">core bridge error: {error}</p>}
-      {status && (
-        <p>
-          spacewise-core v{status.version} — {status.phase}
-        </p>
-      )}
-    </main>
+    <div className="app-shell">
+      <Sidebar />
+      <main className="app-content">
+        <Routes>
+          <Route path="/" element={<Overview />} />
+          <Route path="/storage" element={<Storage />} />
+          <Route path="/cleanup" element={<Cleanup />} />
+          <Route path="/large-files" element={<LargeFiles />} />
+          <Route path="/duplicates" element={<Duplicates />} />
+          <Route path="/applications" element={<Applications />} />
+          <Route path="/developer" element={<Developer />} />
+          <Route path="/history" element={<History />} />
+          <Route path="/settings" element={<Settings />} />
+        </Routes>
+      </main>
+    </div>
   );
 }
 

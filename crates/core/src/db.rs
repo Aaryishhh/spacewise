@@ -97,6 +97,14 @@ pub struct StorageDatabase {
     conn: Connection,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ScanMeta {
+    pub id: Uuid,
+    pub root: PathBuf,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
 impl StorageDatabase {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path)?;
@@ -141,6 +149,27 @@ impl StorageDatabase {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn get_scan(&self, scan_id: Uuid) -> anyhow::Result<Option<ScanMeta>> {
+        let mut stmt = self.conn.prepare("SELECT id, root, started_at, finished_at FROM scans WHERE id = ?1")?;
+        let mut rows = stmt.query_map(params![scan_id.to_string()], |row| {
+            let id: String = row.get(0)?;
+            let root: String = row.get(1)?;
+            let started_at: String = row.get(2)?;
+            let finished_at: Option<String> = row.get(3)?;
+            Ok(ScanMeta {
+                id: Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::nil()),
+                root: PathBuf::from(root),
+                started_at: DateTime::parse_from_rfc3339(&started_at)
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                finished_at: finished_at
+                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|d| d.with_timezone(&Utc)),
+            })
+        })?;
+        rows.next().transpose().map_err(Into::into)
     }
 
     pub fn latest_scan_id(&self) -> anyhow::Result<Option<Uuid>> {
@@ -278,6 +307,18 @@ impl StorageDatabase {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Every aggregated directory for a scan -- used by app-association
+    /// matching, which needs to search all AppData/Library paths, not just
+    /// the subset the classification engine happened to recognise.
+    pub fn all_aggregates(&self, scan_id: Uuid) -> anyhow::Result<Vec<DirectoryAggregate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, total_size, allocated_size, file_count, dir_count, latest_modified
+             FROM directory_aggregates WHERE scan_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![scan_id.to_string()], row_to_aggregate)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn directory_aggregate(&self, scan_id: Uuid, path: &Path) -> anyhow::Result<Option<DirectoryAggregate>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, total_size, allocated_size, file_count, dir_count, latest_modified
@@ -345,6 +386,46 @@ impl StorageDatabase {
                 size: row.get(1)?,
                 content_hash: row.get(2)?,
                 paths: serde_json::from_str(&paths_json).unwrap_or_default(),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    // -- cleanup actions (undo history) ------------------------------------
+
+    pub fn record_cleanup_action(&self, action: &crate::model::CleanupAction) -> anyhow::Result<()> {
+        let paths_json = serde_json::to_string(&action.paths)?;
+        self.conn.execute(
+            "INSERT INTO cleanup_actions (id, performed_at, category_id, paths, bytes_freed, undoable) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                action.id.to_string(),
+                action.performed_at.to_rfc3339(),
+                action.category_id,
+                paths_json,
+                action.bytes_freed,
+                action.undoable as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn recent_cleanup_actions(&self, limit: u32) -> anyhow::Result<Vec<crate::model::CleanupAction>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, performed_at, category_id, paths, bytes_freed, undoable FROM cleanup_actions ORDER BY performed_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            let id: String = row.get(0)?;
+            let performed_at: String = row.get(1)?;
+            let paths_json: String = row.get(3)?;
+            Ok(crate::model::CleanupAction {
+                id: Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::nil()),
+                performed_at: DateTime::parse_from_rfc3339(&performed_at)
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                category_id: row.get(2)?,
+                paths: serde_json::from_str(&paths_json).unwrap_or_default(),
+                bytes_freed: row.get(4)?,
+                undoable: row.get::<_, i64>(5)? != 0,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
