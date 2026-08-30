@@ -10,11 +10,11 @@ pub struct LinuxAdapter;
 
 impl PlatformAdapter for LinuxAdapter {
     fn enrich_metadata(&self, _entry: &mut FileEntry) -> anyhow::Result<()> {
-        unimplemented!("post-V1")
+        Ok(())
     }
 
-    fn move_to_trash(&self, _path: &Path) -> anyhow::Result<()> {
-        unimplemented!("post-V1: XDG trash spec")
+    fn move_to_trash(&self, path: &Path) -> anyhow::Result<()> {
+        trash::delete(path).map_err(|e| anyhow::anyhow!("failed to move {} to trash: {e}", path.display()))
     }
 
     fn is_protected_root(&self, path: &Path) -> bool {

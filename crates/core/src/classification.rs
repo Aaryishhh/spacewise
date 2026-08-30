@@ -42,6 +42,10 @@ impl ClassificationEngine {
     pub fn rules(&self) -> &[ClassificationRule] {
         &self.rules
     }
+
+    pub fn category_by_id(&self, id: &str) -> Option<&StorageCategoryDef> {
+        self.rules.iter().map(|r| &r.category).find(|c| c.id == id)
+    }
 }
 
 impl Default for ClassificationEngine {

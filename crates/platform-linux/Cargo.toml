@@ -7,3 +7,5 @@ license.workspace = true
 [dependencies]
 spacewise-core = { path = "../core" }
 anyhow.workspace = true
+
+trash.workspace = true
