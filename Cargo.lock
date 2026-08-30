@@ -3332,6 +3332,7 @@ dependencies = [
  "chrono",
  "rayon",
  "rusqlite",
+ "same-file",
  "serde",
  "serde_json",
  "tempfile",

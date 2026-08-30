@@ -21,10 +21,10 @@ impl PlatformAdapter for WindowsAdapter {
     fn is_protected_root(&self, path: &Path) -> bool {
         let s = path.to_string_lossy().to_ascii_lowercase();
         const PROTECTED: &[&str] = &[
-            "c:\windows",
-            "c:\system volume information",
-            "c:\pagefile.sys",
-            "c:\hiberfil.sys",
+            r"c:\windows",
+            r"c:\system volume information",
+            r"c:\pagefile.sys",
+            r"c:\hiberfil.sys",
         ];
         PROTECTED.iter().any(|p| s.starts_with(p))
     }
