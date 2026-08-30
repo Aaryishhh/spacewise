@@ -1,8 +1,9 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useScan } from "../store/ScanContext";
 import { formatBytes } from "../api";
 import { CATEGORY_LABELS } from "../categories";
+import { reportMilestone } from "../lib/perf";
 
 const ACTIVE = new Set(["starting", "scanning", "cancelling"]);
 
@@ -17,6 +18,15 @@ export default function Overview() {
   const { dashboard, loading, status, progress, error, runScan, cancelScan } = useScan();
   const [lastResult, setLastResult] = useState<string | null>(null);
   const isActive = ACTIVE.has(status);
+
+  // FIRST_STORAGE_SUMMARY_RENDERED: the first time this page has actually
+  // painted non-empty category totals during/after a scan -- a real
+  // rendered-DOM milestone, not a Rust-internal proxy.
+  useEffect(() => {
+    if (dashboard && dashboard.category_totals.length > 0) {
+      reportMilestone("FIRST_STORAGE_SUMMARY_RENDERED");
+    }
+  }, [dashboard]);
 
   async function pickAndScan() {
     const selected = await open({ directory: true, multiple: false, title: "Choose a folder to scan" });

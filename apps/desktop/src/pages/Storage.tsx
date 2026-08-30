@@ -5,6 +5,7 @@ import { useManualBasket } from "../store/ManualBasketContext";
 import { api, formatBytes, TreemapChild, TreemapNode } from "../api";
 import Treemap from "../components/Treemap";
 import ContextMenu, { ContextMenuItem } from "../components/ContextMenu";
+import { reportMilestone } from "../lib/perf";
 
 type SortKey = "size" | "name" | "modified" | "items";
 
@@ -31,6 +32,7 @@ export default function Storage() {
     if (!dashboard || !path) return;
     try {
       const data = await api.getTreemapNode(dashboard.scan_id, path);
+      reportMilestone("FIRST_TREEMAP_DATA_AVAILABLE"); // backend responded with a node, before paint
       setNode(data);
       setError(null);
     } catch (e) {
@@ -39,6 +41,16 @@ export default function Storage() {
       setLoading(false);
     }
   }, [dashboard, path]);
+
+  // FIRST_TREEMAP_RENDERED: fires after React has actually committed the
+  // treemap with non-empty children to the DOM (queued via
+  // requestAnimationFrame so it reflects the paint, not just the state
+  // update that triggers it).
+  useEffect(() => {
+    if (node && node.children.length > 0) {
+      requestAnimationFrame(() => reportMilestone("FIRST_TREEMAP_RENDERED"));
+    }
+  }, [node]);
 
   useEffect(() => {
     setLoading(true);

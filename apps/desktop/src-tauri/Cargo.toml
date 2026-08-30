@@ -34,3 +34,11 @@ spacewise-platform-macos = { path = "../../../crates/platform-macos" }
 [target.'cfg(target_os = "windows")'.dependencies]
 spacewise-platform-windows = { path = "../../../crates/platform-windows" }
 
+[dev-dependencies]
+# tauri::test::mock_builder was tried for the cancellation-latency test but
+# hit a Windows-specific DLL-loading failure (WebView2Loader.dll not copied
+# next to the test binary) -- the test instead reimplements the scanner/
+# writer/channel shape directly without an AppHandle, so no extra tauri
+# feature is needed here.
+tempfile = "3"
+

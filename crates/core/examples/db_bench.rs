@@ -36,22 +36,35 @@ CREATE TABLE file_entries (
     filesystem_id TEXT
 );
 ";
+// Matches the corrected schema (see crates/core/src/db.rs's index audit
+// comment): idx_file_entries_scan and idx_file_entries_modified were
+// removed (redundant / never actually usable by the query that motivated
+// them); idx_file_entries_parent was added (file_children/treemap hot path
+// had no supporting index before that audit).
 const SCHEMA_INDEXES: &str = "
-CREATE INDEX idx_file_entries_scan ON file_entries(scan_id);
 CREATE INDEX idx_file_entries_size ON file_entries(scan_id, is_dir, logical_size);
-CREATE INDEX idx_file_entries_modified ON file_entries(scan_id, is_dir, modified_at);
+CREATE INDEX idx_file_entries_parent ON file_entries(scan_id, parent, is_dir);
 ";
 
 fn gen_entries(n: usize) -> Vec<FileEntry> {
     let scan_id = Uuid::new_v4();
+    // Realistic path lengths, not the old short "C:/synthetic/gN/fN.dat"
+    // placeholders -- matching the actual generated-tree shape used by
+    // scan_bench.rs's --production mode (temp-dir root + 3 nested levels),
+    // since path/parent string length is what actually drives bytes/row,
+    // and the old short synthetic paths understated real-world DB size.
+    let root = r"C:\Users\aaryi\AppData\Local\Temp\spacewise-bench-1000000";
     (0..n)
         .map(|i| {
-            let dir = i / 50;
+            let d1 = (i / 50) / 400;
+            let d2 = ((i / 50) / 20) % 20;
+            let d3 = (i / 50) % 20;
+            let dir = format!(r"{root}\g{d1}\s{d2}\l{d3}");
             FileEntry {
                 id: Uuid::new_v4(),
                 scan_id,
-                path: PathBuf::from(format!("C:/synthetic/g{}/f{}.dat", dir, i)),
-                parent: Some(PathBuf::from(format!("C:/synthetic/g{}", dir))),
+                path: PathBuf::from(format!(r"{dir}\f{}.dat", i % 50)),
+                parent: Some(PathBuf::from(dir)),
                 logical_size: (i % 100_000) as u64,
                 allocated_size: (i % 100_000) as u64,
                 extension: Some("dat".to_string()),
@@ -63,7 +76,10 @@ fn gen_entries(n: usize) -> Vec<FileEntry> {
                 is_hardlink: false,
                 is_hidden: false,
                 is_system: false,
-                filesystem_id: Some(format!("{i}")),
+                // Matches production on Windows post-fix: unset (see
+                // scanner.rs's compact_filesystem_id) rather than the old
+                // 194-byte same_file::Handle Debug string.
+                filesystem_id: None,
             }
         })
         .collect()

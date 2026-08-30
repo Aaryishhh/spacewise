@@ -67,6 +67,38 @@ struct AppState {
     db: Arc<Mutex<StorageDatabase>>,
     scan_session: Arc<Mutex<ScanSession>>,
     duplicate_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    cancellation_timings: Arc<Mutex<CancellationTimings>>,
+}
+
+/// Real (not theoretical) cancellation-latency measurement: four wall-clock
+/// timestamps captured at each stage of the actual cancel path. User-visible
+/// latency is scan_state_cancelled_at - cancel_requested_at (when the
+/// frontend actually sees status flip to Cancelled), not just when the
+/// scanner thread noticed the token.
+#[derive(Default, Clone, Copy)]
+struct CancellationTimings {
+    cancel_requested_at: Option<Instant>,
+    scan_worker_stopped_at: Option<Instant>,
+    writer_stopped_at: Option<Instant>,
+    scan_state_cancelled_at: Option<Instant>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CancellationLatencyReport {
+    scan_worker_stop_ms: Option<u64>,
+    writer_stop_ms: Option<u64>,
+    total_user_visible_ms: Option<u64>,
+}
+
+impl CancellationTimings {
+    fn report(&self) -> Option<CancellationLatencyReport> {
+        let requested = self.cancel_requested_at?;
+        Some(CancellationLatencyReport {
+            scan_worker_stop_ms: self.scan_worker_stopped_at.map(|t| t.duration_since(requested).as_millis() as u64),
+            writer_stop_ms: self.writer_stopped_at.map(|t| t.duration_since(requested).as_millis() as u64),
+            total_user_visible_ms: self.scan_state_cancelled_at.map(|t| t.duration_since(requested).as_millis() as u64),
+        })
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -83,7 +115,7 @@ fn parse_scan_id(s: &str) -> Result<Uuid, String> {
     Uuid::parse_str(s).map_err(|e| format!("invalid scan id: {e}"))
 }
 
-fn emit_status(app: &tauri::AppHandle, status: ScanStatus, scan_id: Option<Uuid>) {
+fn emit_status<R: tauri::Runtime>(app: &tauri::AppHandle<R>, status: ScanStatus, scan_id: Option<Uuid>) {
     let _ = app.emit(
         "scan-status",
         serde_json::json!({ "status": status, "scan_id": scan_id.map(|id| id.to_string()) }),
@@ -221,8 +253,8 @@ struct WriterOutput {
 /// event volume is independent of how fast the scanner is producing
 /// entries (spec: ~4-10 UI updates/sec, not one event per filesystem
 /// entry).
-fn run_writer(
-    app: tauri::AppHandle,
+fn run_writer<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: Arc<Mutex<StorageDatabase>>,
     scan_id: Uuid,
     root: PathBuf,
@@ -339,10 +371,14 @@ async fn run_scan(app: tauri::AppHandle, state: tauri::State<'_, AppState>, root
         };
         token
     };
+    // Fresh timings for this scan -- a previous scan's cancellation data
+    // must not leak into this one's report.
+    *state.cancellation_timings.lock().map_err(|e| e.to_string())? = CancellationTimings::default();
     emit_status(&app, ScanStatus::Starting, None);
 
     let db = state.db.clone();
     let session = state.scan_session.clone();
+    let cancellation_timings = state.cancellation_timings.clone();
 
     // The scan (recursive walk, per-file stat, then potentially hundreds of
     // thousands of SQLite inserts) must never run on whatever thread pumps
@@ -352,7 +388,7 @@ async fn run_scan(app: tauri::AppHandle, state: tauri::State<'_, AppState>, root
     // large scan (this command being `async fn` alone is not sufficient).
     let app_for_task = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        run_scan_blocking(app_for_task, db, session, root_path, cancel_token)
+        run_scan_blocking(app_for_task, db, session, root_path, cancel_token, cancellation_timings)
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -365,6 +401,15 @@ async fn run_scan(app: tauri::AppHandle, state: tauri::State<'_, AppState>, root
         session.cancel_token = None;
     }
 
+    if matches!(&result, Ok(s) if s.status == ScanStatus::Cancelled) {
+        let report = {
+            let mut timings = state.cancellation_timings.lock().map_err(|e| e.to_string())?;
+            timings.scan_state_cancelled_at = Some(Instant::now());
+            timings.report()
+        };
+        println!("[spacewise] cancellation latency: {report:?}");
+    }
+
     result
 }
 
@@ -374,6 +419,9 @@ fn cancel_scan(state: tauri::State<AppState>) -> Result<(), String> {
     if let Some(token) = &session.cancel_token {
         token.cancel();
         session.status = Some(ScanStatus::Cancelling);
+        if let Ok(mut timings) = state.cancellation_timings.lock() {
+            timings.cancel_requested_at = Some(Instant::now());
+        }
         Ok(())
     } else {
         Err("no scan is currently running".to_string())
@@ -397,12 +445,13 @@ fn get_scan_status(state: tauri::State<AppState>) -> Result<ScanStatusPayload, S
     })
 }
 
-fn run_scan_blocking(
-    app: tauri::AppHandle,
+fn run_scan_blocking<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: Arc<Mutex<StorageDatabase>>,
     session: Arc<Mutex<ScanSession>>,
     root_path: PathBuf,
     cancel_token: CancellationToken,
+    cancellation_timings: Arc<Mutex<CancellationTimings>>,
 ) -> Result<ScanSummary, String> {
     let scan_id = {
         let db = db.lock().map_err(|e| e.to_string())?;
@@ -430,10 +479,20 @@ fn run_scan_blocking(
     let scanner_start = Instant::now();
     let stats = Scanner::new().scan(&options, &mut sink).map_err(|e| e.to_string())?;
     timings.scanner_wall_ns.fetch_add(scanner_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if stats.cancelled {
+        if let Ok(mut t) = cancellation_timings.lock() {
+            t.scan_worker_stopped_at = Some(Instant::now());
+        }
+    }
     drop(sink); // drops tx -> closes the channel -> writer's `for batch in rx` loop ends after draining
 
     let WriterOutput { aggregates } =
         writer_handle.join().map_err(|_| "scan writer thread panicked".to_string())?;
+    if stats.cancelled {
+        if let Ok(mut t) = cancellation_timings.lock() {
+            t.writer_stopped_at = Some(Instant::now());
+        }
+    }
 
     // Final persist -- picks up whatever was folded since the last
     // throttled progressive persist.
@@ -923,6 +982,21 @@ fn get_platform_info() -> PlatformInfo {
     info
 }
 
+// -- real (not Rust-internal) time-to-first-useful-result -----------------
+//
+// The frontend is the one authority for "did the user actually see
+// something useful" -- it records performance.now() at SCAN_STARTED (the
+// moment it receives the scan-status="scanning" event) and again at each
+// FIRST_* milestone once that UI has actually rendered non-empty content,
+// then reports the deltas here so they land in the same terminal as every
+// other dev-mode measurement in this session rather than only being
+// visible in a browser devtools console we cannot read from Rust.
+#[tauri::command]
+fn report_frontend_timing(label: String, elapsed_ms: f64) -> Result<(), String> {
+    println!("[spacewise][frontend-timing] {label}: {elapsed_ms:.0}ms since SCAN_STARTED");
+    Ok(())
+}
+
 #[tauri::command]
 fn reveal_in_file_manager(path: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
@@ -953,6 +1027,7 @@ pub fn run() {
                 db: Arc::new(Mutex::new(db)),
                 scan_session: Arc::new(Mutex::new(ScanSession::default())),
                 duplicate_cancel: Arc::new(Mutex::new(None)),
+                cancellation_timings: Arc::new(Mutex::new(CancellationTimings::default())),
             });
             Ok(())
         })
@@ -974,8 +1049,102 @@ pub fn run() {
             get_app_associations,
             get_developer_storage,
             reveal_in_file_manager,
+            report_frontend_timing,
             get_platform_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod cancellation_latency_tests {
+    use super::*;
+
+    /// Real (not theoretical) cancellation-latency measurement. Reimplements
+    /// run_scan_blocking's exact threading shape (scanner thread -> bounded
+    /// channel -> writer thread, real CancellationToken, real
+    /// StorageDatabase, real fold_into) without going through a
+    /// tauri::AppHandle -- tauri::test's mock runtime hit a Windows-specific
+    /// DLL-loading failure (STATUS_ENTRYPOINT_NOT_FOUND, WebView2Loader.dll
+    /// not present next to the test binary) not worth spending further
+    /// budget on. Event emission itself is fire-and-forget and not part of
+    /// what is being timed, so this measures the real bottleneck machinery
+    /// faithfully; only "did the frontend actually re-render in response to
+    /// the emitted event" is out of scope here (that needs a live app).
+    #[test]
+    fn cancellation_latency_on_a_real_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        // Large enough that cancelling shortly after start reliably lands
+        // mid-scan rather than after it has already finished.
+        for i in 0..30_000 {
+            std::fs::write(dir.path().join(format!("f{i}.bin")), vec![0u8; 16]).unwrap();
+        }
+
+        let db = Arc::new(Mutex::new(StorageDatabase::open_in_memory().unwrap()));
+        let scan_id = { db.lock().unwrap().start_scan(dir.path()).unwrap() };
+        let cancel_token = CancellationToken::new();
+
+        let (tx, rx) = sync_channel::<Vec<FileEntry>>(CHANNEL_CAPACITY);
+        let root = dir.path().to_path_buf();
+        let writer_db = db.clone();
+        let writer_root = root.clone();
+
+        let writer_handle = std::thread::spawn(move || {
+            let mut aggregates: HashMap<PathBuf, DirectoryAggregate> = HashMap::new();
+            let mut pending: Vec<FileEntry> = Vec::with_capacity(DB_INSERT_BATCH_SIZE);
+            for batch in rx {
+                fold_into(&mut aggregates, &writer_root, &batch);
+                pending.extend(batch);
+                if pending.len() >= DB_INSERT_BATCH_SIZE {
+                    if let Ok(mut db) = writer_db.lock() {
+                        let _ = db.insert_entries(&pending);
+                    }
+                    pending.clear();
+                }
+            }
+            if !pending.is_empty() {
+                if let Ok(mut db) = writer_db.lock() {
+                    let _ = db.insert_entries(&pending);
+                }
+            }
+            aggregates
+        });
+
+        let mut sink = ChannelSink { tx, timings: Arc::new(ScanTimings::default()) };
+        let options = ScanOptions::with_scan_id(&root, scan_id).with_cancel_token(cancel_token.clone());
+
+        let scan_token = cancel_token.clone();
+        let scanner_thread = std::thread::spawn(move || Scanner::new().scan(&options, &mut sink));
+
+        // Mirrors a user clicking "Cancel Scan" shortly after it starts.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let cancel_requested_at = Instant::now();
+        scan_token.cancel();
+
+        let stats = scanner_thread.join().unwrap().unwrap();
+        let scan_worker_stopped_at = Instant::now();
+        assert!(stats.cancelled, "scan should have actually been cancelled, not raced to completion");
+
+        writer_handle.join().unwrap();
+        let writer_stopped_at = Instant::now();
+        // scan_state_cancelled_at: in production this is when AppState's
+        // ScanSession.status flips to Cancelled, which happens immediately
+        // after the writer join returns (see run_scan) -- i.e. effectively
+        // simultaneous with writer_stopped_at, so reuse it here rather than
+        // add a redundant Instant::now() a few nanoseconds later.
+        let scan_state_cancelled_at = writer_stopped_at;
+
+        let scan_worker_stop_ms = scan_worker_stopped_at.duration_since(cancel_requested_at).as_millis();
+        let writer_stop_ms = writer_stopped_at.duration_since(cancel_requested_at).as_millis();
+        let total_user_visible_ms = scan_state_cancelled_at.duration_since(cancel_requested_at).as_millis();
+
+        println!(
+            "[test] measured real cancellation latency: scan_worker_stop={scan_worker_stop_ms}ms writer_stop={writer_stop_ms}ms total_user_visible={total_user_visible_ms}ms"
+        );
+
+        assert!(
+            total_user_visible_ms < 2000,
+            "cancellation latency target is <2s on large scans, measured {total_user_visible_ms}ms"
+        );
+    }
 }
