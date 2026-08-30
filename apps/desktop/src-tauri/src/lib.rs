@@ -17,15 +17,19 @@ use spacewise_core::model::{
 };
 use spacewise_core::recommend::RecommendationEngine;
 use spacewise_core::safety::SafetyEngine;
-use spacewise_core::scanner::{CollectingSink, ScanOptions, ScanStats, Scanner};
+use spacewise_core::scanner::{ScanOptions, ScanStats, Scanner};
 use spacewise_core::uninstall::associate_apps_with_storage;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use tauri::Manager;
+use std::sync::{Arc, Mutex};
+use tauri::{Emitter, Manager};
 use uuid::Uuid;
 
 struct AppState {
-    db: Mutex<StorageDatabase>,
+    // Arc, not a bare Mutex, so run_scan can clone a 'static handle into a
+    // spawn_blocking task -- a plain State<'_, AppState> borrow can't cross
+    // that boundary, and a scan running on the wrong thread is exactly what
+    // made the whole window "Not Responding" during a large scan.
+    db: Arc<Mutex<StorageDatabase>>,
 }
 
 #[cfg(target_os = "windows")]
@@ -61,23 +65,71 @@ struct ScanSummary {
     total_size: u64,
 }
 
+/// Streams progress to the frontend as `scan-progress` events (files/dirs/
+/// bytes seen so far) and still buffers everything for the aggregate step,
+/// same as CollectingSink. Emitted at most every 250ms so a huge scan does
+/// not flood IPC with an event per 1024-entry batch.
+struct EmittingSink {
+    app: tauri::AppHandle,
+    entries: Vec<FileEntry>,
+    last_emit: std::time::Instant,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct ScanProgressPayload {
+    files_scanned: usize,
+    dirs_scanned: usize,
+    total_logical_size: u64,
+}
+
+impl spacewise_core::scanner::ScanProgressSink for EmittingSink {
+    fn on_entries(&mut self, mut entries: Vec<FileEntry>) {
+        self.entries.append(&mut entries);
+        if self.last_emit.elapsed() > std::time::Duration::from_millis(250) {
+            let files_scanned = self.entries.iter().filter(|e| !e.is_dir).count();
+            let dirs_scanned = self.entries.len() - files_scanned;
+            let total_logical_size = self.entries.iter().map(|e| e.logical_size).sum();
+            let _ = self.app.emit(
+                "scan-progress",
+                ScanProgressPayload { files_scanned, dirs_scanned, total_logical_size },
+            );
+            self.last_emit = std::time::Instant::now();
+        }
+    }
+    fn on_complete(&mut self, _stats: &ScanStats) {}
+}
+
 #[tauri::command]
-fn run_scan(state: tauri::State<AppState>, root: String) -> Result<ScanSummary, String> {
+async fn run_scan(app: tauri::AppHandle, state: tauri::State<'_, AppState>, root: String) -> Result<ScanSummary, String> {
+    let db = state.db.clone();
     let root_path = PathBuf::from(&root);
     if !root_path.exists() {
         return Err(format!("path does not exist: {root}"));
     }
 
-    let mut db = state.db.lock().map_err(|e| e.to_string())?;
+    // The scan (recursive walk, per-file stat, then potentially hundreds of
+    // thousands of SQLite inserts) must never run on whatever thread pumps
+    // the window's message loop -- spawn_blocking guarantees a dedicated
+    // blocking-pool thread regardless of how the surrounding async runtime
+    // is configured, which is what actually fixes "Not Responding" on a
+    // large scan (this command being `async fn` alone is not sufficient).
+    tauri::async_runtime::spawn_blocking(move || run_scan_blocking(app, db, root_path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn run_scan_blocking(app: tauri::AppHandle, db: Arc<Mutex<StorageDatabase>>, root_path: PathBuf) -> Result<ScanSummary, String> {
+    let mut db = db.lock().map_err(|e| e.to_string())?;
     let scan_id = db.start_scan(&root_path).map_err(|e| e.to_string())?;
 
-    let mut sink = CollectingSink::default();
+    let mut sink = EmittingSink { app: app.clone(), entries: Vec::new(), last_emit: std::time::Instant::now() };
     let options = ScanOptions::with_scan_id(&root_path, scan_id);
     let stats = Scanner::new().scan(&options, &mut sink).map_err(|e| e.to_string())?;
+    let entries = sink.entries;
 
-    db.insert_entries(&sink.entries).map_err(|e| e.to_string())?;
+    db.insert_entries(&entries).map_err(|e| e.to_string())?;
 
-    let aggregates = aggregate_directories(&root_path, &sink.entries);
+    let aggregates = aggregate_directories(&root_path, &entries);
     db.upsert_directory_aggregates(scan_id, &aggregates).map_err(|e| e.to_string())?;
 
     let classifier = ClassificationEngine::new();
@@ -92,10 +144,10 @@ fn run_scan(state: tauri::State<AppState>, root: String) -> Result<ScanSummary, 
 
     db.finish_scan(scan_id, &stats).map_err(|e| e.to_string())?;
 
-    let dup_groups = DuplicateEngine::new().find_duplicates(&sink.entries);
-    if !dup_groups.is_empty() {
-        db.insert_duplicate_groups(scan_id, &dup_groups).map_err(|e| e.to_string())?;
-    }
+    // Duplicate detection reads full file contents for every same-size
+    // candidate -- on a large scan that is minutes of I/O by itself.
+    // Deferred to get_duplicates (computed lazily, once, on first visit to
+    // the Duplicates page) so a plain "scan a folder" never pays that cost.
 
     let total_size = db
         .directory_aggregate(scan_id, &root_path)
@@ -104,6 +156,8 @@ fn run_scan(state: tauri::State<AppState>, root: String) -> Result<ScanSummary, 
         .unwrap_or(stats.total_logical_size);
 
     HistoryEngine::new().record_snapshot(&db, scan_id, total_size).map_err(|e| e.to_string())?;
+
+    let _ = app.emit("scan-complete", ());
 
     Ok(ScanSummary { scan_id: scan_id.to_string(), stats, total_size })
 }
@@ -172,10 +226,27 @@ fn get_recommendations(state: tauri::State<AppState>, scan_id: String) -> Result
 }
 
 #[tauri::command]
-fn get_duplicates(state: tauri::State<AppState>, scan_id: String) -> Result<Vec<DuplicateGroup>, String> {
+async fn get_duplicates(state: tauri::State<'_, AppState>, scan_id: String) -> Result<Vec<DuplicateGroup>, String> {
     let scan_id = parse_scan_id(&scan_id)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.duplicate_groups(scan_id).map_err(|e| e.to_string())
+    let db = state.db.clone();
+    // Full-file-content hashing is expensive on a large scan -- computed
+    // lazily here (once; persisted after) rather than eagerly in run_scan,
+    // and still kept off the window/event-loop thread via spawn_blocking.
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut db = db.lock().map_err(|e| e.to_string())?;
+        let existing = db.duplicate_groups(scan_id).map_err(|e| e.to_string())?;
+        if !existing.is_empty() {
+            return Ok(existing);
+        }
+        let files = db.all_file_entries(scan_id).map_err(|e| e.to_string())?;
+        let groups = DuplicateEngine::new().find_duplicates(&files);
+        if !groups.is_empty() {
+            db.insert_duplicate_groups(scan_id, &groups).map_err(|e| e.to_string())?;
+        }
+        Ok(groups)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[derive(serde::Serialize)]
@@ -185,29 +256,37 @@ struct CleanupOutcome {
 }
 
 #[tauri::command]
-fn execute_cleanup(state: tauri::State<AppState>, candidate: CleanupCandidate) -> Result<CleanupOutcome, String> {
-    let adapter = platform_adapter();
-    let executor = CleanupExecutor::new(adapter.as_ref());
-    let mut succeeded = Vec::new();
-    let mut failed = Vec::new();
-    for result in executor.execute(&candidate) {
-        match result {
-            Ok(action) => succeeded.push(action),
-            Err(e) => failed.push(e.to_string()),
+async fn execute_cleanup(state: tauri::State<'_, AppState>, candidate: CleanupCandidate) -> Result<CleanupOutcome, String> {
+    let db = state.db.clone();
+    // Computing bytes-freed (a full walkdir per path) and the actual
+    // trash/recycle-bin move are real filesystem I/O -- same reasoning as
+    // run_scan, keep it off the window thread.
+    tauri::async_runtime::spawn_blocking(move || {
+        let adapter = platform_adapter();
+        let executor = CleanupExecutor::new(adapter.as_ref());
+        let mut succeeded = Vec::new();
+        let mut failed = Vec::new();
+        for result in executor.execute(&candidate) {
+            match result {
+                Ok(action) => succeeded.push(action),
+                Err(e) => failed.push(e.to_string()),
+            }
         }
-    }
 
-    // Record every successful action so the History page can show what was
-    // cleaned and (spec section 10) point back to the Trash/Recycle Bin item
-    // for restore.
-    if !succeeded.is_empty() {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        for action in &succeeded {
-            db.record_cleanup_action(action).map_err(|e| e.to_string())?;
+        // Record every successful action so the History page can show what
+        // was cleaned and (spec section 10) point back to the Trash/Recycle
+        // Bin item for restore.
+        if !succeeded.is_empty() {
+            let db = db.lock().map_err(|e| e.to_string())?;
+            for action in &succeeded {
+                db.record_cleanup_action(action).map_err(|e| e.to_string())?;
+            }
         }
-    }
 
-    Ok(CleanupOutcome { succeeded, failed })
+        Ok(CleanupOutcome { succeeded, failed })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -270,7 +349,7 @@ pub fn run() {
             std::fs::create_dir_all(&app_data_dir)?;
             let db_path = app_data_dir.join("spacewise.db");
             let db = StorageDatabase::open(&db_path)?;
-            app.manage(AppState { db: Mutex::new(db) });
+            app.manage(AppState { db: Arc::new(Mutex::new(db)) });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

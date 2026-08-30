@@ -4,7 +4,7 @@ import { formatBytes } from "../api";
 import { CATEGORY_LABELS } from "../categories";
 
 export default function Overview() {
-  const { dashboard, loading, scanning, error, runScan } = useScan();
+  const { dashboard, loading, scanning, progress, error, runScan } = useScan();
 
   async function pickAndScan() {
     const selected = await open({ directory: true, multiple: false, title: "Choose a folder to scan" });
@@ -34,6 +34,13 @@ export default function Overview() {
             {scanning ? "Scanning..." : "Scan a Folder"}
           </button>
         </div>
+        {scanning && (
+          <div style={{ marginTop: 14, fontSize: 12.5, color: "var(--text-secondary)" }}>
+            {progress
+              ? `${progress.files_scanned.toLocaleString()} files, ${progress.dirs_scanned.toLocaleString()} folders, ${formatBytes(progress.total_logical_size)} so far...`
+              : "Starting scan..."}
+          </div>
+        )}
       </div>
 
       {loading && <div className="empty-state">Loading...</div>}

@@ -246,6 +246,18 @@ impl StorageDatabase {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Every file (non-directory) entry for a scan -- used to lazily compute
+    /// duplicates on first visit to the Duplicates page, rather than paying
+    /// full-file-content hashing cost on every scan up front.
+    pub fn all_file_entries(&self, scan_id: Uuid) -> anyhow::Result<Vec<FileEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, scan_id, path, parent, logical_size, allocated_size, extension, created_at, modified_at, accessed_at, is_dir, is_symlink, is_hardlink, is_hidden, is_system, filesystem_id
+             FROM file_entries WHERE scan_id = ?1 AND is_dir = 0",
+        )?;
+        let rows = stmt.query_map(params![scan_id.to_string()], row_to_file_entry)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     // -- directory aggregates ---------------------------------------------
 
     pub fn upsert_directory_aggregates(
