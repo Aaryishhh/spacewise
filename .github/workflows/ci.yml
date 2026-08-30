@@ -28,3 +28,15 @@ jobs:
 
       - name: cargo test (workspace)
         run: cargo test --workspace --locked
+
+      - name: Install frontend deps
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Frontend typecheck + build
+        working-directory: apps/desktop
+        run: npm run build
+
+      - name: Tauri build (debug, no bundling)
+        working-directory: apps/desktop
+        run: npm run tauri build -- --debug --no-bundle
