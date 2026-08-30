@@ -307,6 +307,13 @@ fn run_writer(
     }
 
     flush(&mut pending);
+    // One deliberate checkpoint at the end of the scan (not per-batch,
+    // which would reintroduce the serialization this pipeline was built to
+    // remove) -- keeps the on-disk footprint reflecting retained data
+    // rather than accumulated WAL, at zero cost to in-scan throughput.
+    if let Ok(db) = db.lock() {
+        let _ = db.checkpoint_wal();
+    }
     timings.writer_wall_ns.fetch_add(writer_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
     WriterOutput { aggregates }
 }
